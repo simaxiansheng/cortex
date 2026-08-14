@@ -18,10 +18,11 @@
     pdf: "PDF", pptx: "PPTX", docx: "DOCX", web: "WEB", yt: "YT", audio: "AUD", image: "IMG",
   };
 
-  // Count-based formats and their clamps; other formats have no "how many".
-  const COUNT_LIMITS: Record<string, { min: number; max: number; def: number }> = {
-    flashcards: { min: 4, max: 40, def: 14 },
-    quiz: { min: 3, max: 30, def: 10 },
+  // Count-based formats. Counts have a minimum but deliberately no product-imposed
+  // maximum: users can request as many quiz questions or flashcards as they need.
+  const COUNT_LIMITS: Record<string, { min: number; def: number }> = {
+    flashcards: { min: 4, def: 14 },
+    quiz: { min: 3, def: 10 },
   };
 
   // ── Derived from real active subject ─────────────────────────
@@ -93,7 +94,7 @@
 
   function setCount(n: number) {
     if (!countLimit) return;
-    const v = Math.max(countLimit.min, Math.min(countLimit.max, Math.round(n) || countLimit.def));
+    const v = Math.max(countLimit.min, Math.round(n) || countLimit.def);
     if (type === "flashcards") cardCount = v;
     else if (type === "quiz") quizCount = v;
   }
@@ -181,11 +182,19 @@
           <div class="gm2-count">
             <div class="gm2-step">
               <button class="btn btn--icon btn--sm" onclick={() => setCount(countValue - 1)} aria-label="fewer" disabled={countValue <= countLimit.min}>−</button>
-              <span class="mono gm2-step-v">{countValue}</span>
-              <button class="btn btn--icon btn--sm" onclick={() => setCount(countValue + 1)} aria-label="more" disabled={countValue >= countLimit.max}>+</button>
+              <input
+                class="input mono gm2-step-v gm2-step-input"
+                type="number"
+                min={countLimit.min}
+                step="1"
+                value={countValue}
+                aria-label={type === "quiz" ? "Number of questions" : "Number of cards"}
+                onchange={(event) => setCount(Number(event.currentTarget.value))}
+              />
+              <button class="btn btn--icon btn--sm" onclick={() => setCount(countValue + 1)} aria-label="more">+</button>
             </div>
             <div class="seg gm2-count-presets">
-              {#each [Math.round(countLimit.def / 2), countLimit.def, Math.min(countLimit.max, countLimit.def * 2)] as p}
+              {#each [Math.round(countLimit.def / 2), countLimit.def, countLimit.def * 2] as p}
                 <button class="seg-opt{countValue === p ? ' on' : ''}" onclick={() => setCount(p)}>{p}</button>
               {/each}
             </div>
@@ -323,6 +332,7 @@
   .gm2-count { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .gm2-step { display: flex; align-items: center; gap: 8px; }
   .gm2-step-v { min-width: 36px; text-align: center; color: var(--fg-bright); font-variant-numeric: tabular-nums; }
+  .gm2-step-input { width: 72px; min-width: 72px; height: 28px; padding: 0 6px; }
   .gm2-count-presets { margin-left: auto; }
 
   /* label qualifier — quietly subordinate to the uppercase mono eyebrow label */

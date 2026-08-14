@@ -2840,11 +2840,11 @@ pub async fn generate_material(
         ));
     }
 
-    // How many items to generate, when the kind is count-based. The user can set
-    // this in GenerateMaterial; clamp to a sane range so a bad value can't ask the
-    // model for 0 or 500 cards.
-    let quiz_n = count.unwrap_or(9).clamp(3, 30);
-    let card_n = count.unwrap_or(14).clamp(4, 40);
+    // How many items to generate, when the kind is count-based. Keep a minimum so
+    // an empty or invalid request still makes useful material, but do not impose a
+    // product limit: the chosen model's output budget is the practical constraint.
+    let quiz_n = count.unwrap_or(9).max(3);
+    let card_n = count.unwrap_or(14).max(4);
 
     // Per-kind prompt + payload shape.
     let (system, default_title) = match kind.as_str() {

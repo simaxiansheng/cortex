@@ -1000,6 +1000,8 @@ const zh: Record<string, string> = {
   "e.g. Essay 2, Capstone, Midterm…": "例如：论文 2、毕业设计、期中考试…",
   "endpoint.": "端点。",
   "fewer": "更少",
+  "Number of cards": "闪卡数量",
+  "Number of questions": "题目数量",
   "fewer multiple choice questions": "减少选择题数量",
   "fewer written questions": "减少主观题数量",
   "follow omarchy theme": "跟随 Omarchy 主题",
