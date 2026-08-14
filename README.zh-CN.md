@@ -24,7 +24,7 @@
 
 ### 思考力度
 
-在“设置 → 模型”中选择全局“思考力度”。默认值不会覆盖服务商设置；选择后会自动按服务商协议发送参数：直连 DeepSeek V4 启用/关闭 `thinking` 并使用 `reasoning_effort`，OpenRouter 使用 `reasoning.effort`。DeepSeek V4 的 `low`、`medium`、`high` 均会映射为 `high`，`maximum` 映射为 `max`。
+在“设置 → 模型”中选择全局“思考力度”。默认值不会覆盖服务商设置；选择后会自动按服务商协议发送参数：直连 DeepSeek V4 启用/关闭 `thinking` 并使用 `reasoning_effort`，OpenRouter 使用 `reasoning.effort`。DeepSeek V4 的 `low` 保持为 `low`，`medium`、`high` 映射为 `high`，`maximum` 映射为 `max`。
 
 ### 百炼 Embedding 示例
 

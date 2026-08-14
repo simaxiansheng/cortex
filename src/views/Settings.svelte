@@ -1553,7 +1553,7 @@ Notes: {about}</pre>
           <div class="set-row">
             <div>
               <div class="set-row-t">Thinking effort</div>
-              <div class="set-row-d">Controls only providers with a supported reasoning API. DeepSeek V4 maps low, medium and high to high, and maximum to max; OpenRouter forwards the selected effort.</div>
+              <div class="set-row-d">Controls only providers with a supported reasoning API. DeepSeek V4 keeps low, maps medium and high to high, and maps maximum to max; OpenRouter forwards the selected effort.</div>
             </div>
             <Picker
               value={reasoningEffort}

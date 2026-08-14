@@ -311,14 +311,17 @@ impl OpenAiCompatLlm {
             });
         } else if is_deepseek_v4 {
             // DeepSeek V4's OpenAI-compatible endpoint uses both a thinking
-            // toggle and a high/max effort. It maps low and medium to high.
+            // toggle and a low/high/max effort. Its `medium` UI choice maps to
+            // the API's `high` value, while `low` and `max` remain unchanged.
             if effort == "off" {
                 body["thinking"] = serde_json::json!({ "type": "disabled" });
             } else {
                 body["thinking"] = serde_json::json!({ "type": "enabled" });
-                body["reasoning_effort"] = serde_json::json!(
-                    if effort == "max" { "max" } else { "high" }
-                );
+                body["reasoning_effort"] = serde_json::json!(match effort {
+                    "low" => "low",
+                    "max" => "max",
+                    _ => "high",
+                });
             }
         } else if self.label == "openai" {
             // OpenAI reasoning models use this top-level field; its highest
@@ -803,6 +806,15 @@ mod tests {
         disabled.apply_reasoning(&mut body);
         assert_eq!(body["thinking"]["type"], "disabled");
         assert!(body.get("reasoning_effort").is_none());
+
+        let low = OpenAiCompatLlm {
+            reasoning_effort: Some("low".into()),
+            ..disabled
+        };
+        let mut body = serde_json::json!({});
+        low.apply_reasoning(&mut body);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "low");
 
         let openai = OpenAiCompatLlm {
             base_url: "https://api.openai.com/v1".into(),

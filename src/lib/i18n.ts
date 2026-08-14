@@ -109,7 +109,7 @@ const zh: Record<string, string> = {
   "Medium": "中",
   "High": "高",
   "Maximum": "最高",
-  "Controls only providers with a supported reasoning API. DeepSeek V4 maps low, medium and high to high, and maximum to max; OpenRouter forwards the selected effort.": "仅对支持推理参数的服务商生效。DeepSeek V4 会将低、中、高都映射为高，最高映射为 max；OpenRouter 会转发所选力度。",
+  "Controls only providers with a supported reasoning API. DeepSeek V4 keeps low, maps medium and high to high, and maps maximum to max; OpenRouter forwards the selected effort.": "仅对支持推理参数的服务商生效。DeepSeek V4 的低保持为低，中、高映射为高，最高映射为 max；OpenRouter 会转发所选力度。",
   "Scoped Q&A across sources": "在选定资料范围内问答",
   "Cheatsheet synthesis": "知识速览生成",
   "Completeness-checked merges": "检查完整性的合并整理",
