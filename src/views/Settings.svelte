@@ -1019,9 +1019,12 @@
   }
 
   async function deleteEverything() {
-    const ok = window.confirm(
-      "Delete ALL data?\n\nThis wipes the local database — every subject, source, cheatsheet, and embedding. This cannot be undone. Your settings and API keys are kept.",
-    );
+    const ok = await app.confirm({
+      title: "Delete ALL data?",
+      body: "This wipes the local database — every subject, source, cheatsheet, and embedding. This cannot be undone. Your settings and API keys are kept.",
+      danger: true,
+      okLabel: "Delete all",
+    });
     if (!ok) return;
     try {
       await api.deleteAllData();
