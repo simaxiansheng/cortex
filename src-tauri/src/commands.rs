@@ -18,11 +18,11 @@ const NO_MODEL: &str =
     "No model configured — add an API key in Settings → API keys (Gemini or OpenRouter), then pick it under Settings → Models.";
 
 /// Default for everything that reads the `model_chat` setting (chat, plus the
-/// auto-rename / transcript helpers). A fast NON-reasoning model: the chat path is
-/// blocking (total latency == perceived time-to-first-token) and must reliably emit
-/// the inline ⟦source · loc⟧ citation markers the UI renders. DeepSeek V4 Flash is the
-/// platform-wide default — very cheap ($0.09/$0.18 per Mtok), 1M context, fast and
-/// non-reasoning — falling back to any configured key (see llm::from_spec_or_any).
+/// auto-rename / transcript helpers). A fast default: the chat path is blocking
+/// (total latency == perceived time-to-first-token) and must reliably emit the inline
+/// ⟦source · loc⟧ citation markers the UI renders. DeepSeek V4 Flash remains the
+/// platform-wide default; compatible providers can apply the user-selected thinking
+/// effort. It falls back to any configured key (see llm::from_spec_or_any).
 const DEFAULT_CHAT_MODEL: &str = "openrouter:deepseek/deepseek-v4-flash";
 
 /// Default for the OCR / vision helper (`ocr_via_vision`). MUST be vision-capable —
@@ -81,8 +81,8 @@ pub(crate) fn guard_offline_llm(c: &Connection, spec: &str) -> Result<()> {
 }
 
 /// The embedding provider to actually use. In offline mode, cloud providers
-/// (gemini/openai) are downgraded to the local "stub" embedder so ingestion and
-/// retrieval keep working with zero network calls (Ollama embeddings stay local).
+/// are downgraded to the local "stub" embedder so ingestion and retrieval keep
+/// working with zero network calls (Ollama embeddings stay local).
 fn effective_embed_provider(c: &Connection) -> String {
     let p = repo::get_setting(c, "embed_provider")
         .ok()
@@ -92,6 +92,67 @@ fn effective_embed_provider(c: &Connection) -> String {
         "stub".into()
     } else {
         p
+    }
+}
+
+/// Resolve the vector provider once, then hand the same configuration to every
+/// ingestion and retrieval path. `model_embedding` is deliberately independent
+/// from text-generation models; a user can keep DeepSeek for chat and use an
+/// OpenAI-compatible vector endpoint such as Bailian for retrieval.
+pub(crate) fn embedding_config(c: &Connection) -> Result<embed::EmbedConfig> {
+    let provider = effective_embed_provider(c);
+    let default_model = match provider.as_str() {
+        "gemini" => "text-embedding-004",
+        "openai" => "text-embedding-3-small",
+        "ollama" => "nomic-embed-text",
+        "custom" => "text-embedding-v4",
+        _ => "",
+    };
+    let model = repo::get_setting(c, "model_embedding")?
+        .and_then(|raw| {
+            let (configured_provider, model) = raw.split_once(':')?;
+            (configured_provider == provider && !model.trim().is_empty())
+                .then(|| model.trim().to_string())
+        })
+        .unwrap_or_else(|| default_model.to_string());
+    let setting = |key: &str| -> Result<Option<String>> {
+        Ok(repo::get_setting(c, key)?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()))
+    };
+
+    let (api_key, base_url) = match provider.as_str() {
+        "gemini" => (setting("gemini_api_key")?, None),
+        "openai" => (setting("openai_api_key")?, Some("https://api.openai.com/v1".to_string())),
+        "custom" => {
+            // Keep the embedding credentials separate from a custom chat endpoint.
+            // The legacy generic custom values remain a safe fallback for existing
+            // installs that already used a single compatible provider for both.
+            let endpoint = setting("embed_custom_endpoint")?
+                .or(setting("custom_endpoint")?);
+            let key = setting("embed_custom_api_key")?
+                .or(setting("custom_api_key")?);
+            (key, endpoint)
+        }
+        _ => (None, None),
+    };
+
+    Ok(embed::EmbedConfig {
+        provider,
+        model,
+        api_key,
+        base_url,
+        ollama_url: crate::homelab::resolved_setting(c, "ollama_url"),
+    })
+}
+
+/// One setting drives both interface language and generated-output language in
+/// the standalone Chinese edition. Defaulting here keeps pre-existing databases
+/// Chinese even before the frontend has written its first preference value.
+pub(crate) fn output_language(c: &Connection) -> String {
+    match repo::get_setting(c, "ui_language") {
+        Ok(Some(value)) if value.trim() == "en" => "en".to_string(),
+        _ => "zh-CN".to_string(),
     }
 }
 
@@ -127,6 +188,9 @@ pub(crate) fn read_keys(c: &Connection) -> Result<llm::Keys> {
         // Resolve through the homelab fallback chain so Ollama chat also works
         // over Tailscale/public, not just on the LAN.
         ollama_url: crate::homelab::resolved_setting(c, "ollama_url"),
+        reasoning_effort: key("reasoning_effort")?.filter(|value| {
+            matches!(value.as_str(), "off" | "low" | "medium" | "high" | "max")
+        }),
     })
 }
 
@@ -176,6 +240,35 @@ pub async fn ollama_models(state: State<'_, AppState>) -> Result<Vec<String>> {
     })
     .await
     .unwrap_or_default())
+}
+
+/// Send one harmless short string through the selected embedding provider. This
+/// validates the real `/embeddings` contract (rather than a chat endpoint) and
+/// returns only provider/model/vector metadata — never a credential.
+#[tauri::command]
+pub async fn test_embedding(state: State<'_, AppState>) -> Result<String> {
+    let config = {
+        let c = state.db.lock().unwrap();
+        embedding_config(&c)?
+    };
+    if config.provider == "stub" {
+        return Err(Error::Other(
+            "No embedding provider is configured — choose one in Settings → Models first.".into(),
+        ));
+    }
+    let provider = config.provider.clone();
+    let model = config.model.clone();
+    let vector = tauri::async_runtime::spawn_blocking(move || {
+        let embedder = embed::from_config(&config);
+        embedder.embed(&["Cortex embedding connection test".to_string()])
+    })
+    .await
+    .map_err(|e| Error::Other(format!("embedding test task failed: {e}")))??;
+    let dim = vector.first().map(Vec::len).unwrap_or(0);
+    if dim == 0 {
+        return Err(Error::Other("Embedding provider returned an empty vector.".into()));
+    }
+    Ok(format!("{provider}:{model} · {dim} dimensions"))
 }
 
 /// Result of a provider connection check (Settings → API keys "verify").
@@ -613,14 +706,14 @@ fn auto_rename_source(state: &State<AppState>, source_id: &str, original_name: &
     if text.trim().chars().count() < 80 {
         return; // too little content to name meaningfully
     }
-    let (spec, keys) = {
+    let (spec, keys, language) = {
         let c = state.db.lock().unwrap();
         let spec = match repo::get_setting(&c, "model_chat") {
             Ok(Some(s)) => s,
             _ => DEFAULT_CHAT_MODEL.to_string(),
         };
         match read_keys(&c) {
-            Ok(k) => (spec, k),
+            Ok(k) => (spec, k, output_language(&c)),
             Err(_) => return,
         }
     };
@@ -633,8 +726,9 @@ fn auto_rename_source(state: &State<AppState>, source_id: &str, original_name: &
         max 8 words, no quotes, no file extension, no trailing punctuation). If the original \
         filename contains a lecture/week/chapter/unit/topic number (e.g. \"Lecture 14\", \
         \"Week 3\"), KEEP that number in the title.";
+    let sys = llm::with_output_language(sys, &language);
     let user = format!("Original filename: {original_name}\n\nContent excerpt:\n{excerpt}\n\nTitle:");
-    let Ok(raw) = model.complete(sys, &user) else {
+    let Ok(raw) = model.complete(&sys, &user) else {
         return;
     };
     let title = raw
@@ -825,15 +919,11 @@ pub async fn reingest_source(app: AppHandle, id: String) -> Result<IngestResult>
 
         emit_progress(&app, &id, "chunking", "splitting text", 50);
         let chunks = ingest::chunk_text(&text, 900, 150);
-        let (provider, gemini_key, ollama_url) = {
+        let embedding = {
             let c = state.db.lock().unwrap();
-            (
-                effective_embed_provider(&c),
-                repo::get_setting(&c, "gemini_api_key")?,
-                crate::homelab::resolved_setting(&c, "ollama_url"),
-            )
+            embedding_config(&c)?
         };
-        let embedder = embed::from_settings(&provider, gemini_key.as_deref(), ollama_url.as_deref());
+        let embedder = embed::from_config(&embedding);
         emit_progress(&app, &id, "embedding", &format!("{} chunks", chunks.len()), 70);
         let vectors = ingest::embed_chunks(embedder.as_ref(), &chunks)
             .or_else(|_| ingest::embed_chunks(&embed::StubEmbedder, &chunks))?;
@@ -1106,15 +1196,11 @@ pub async fn add_source(
         &format!("{} chunks", chunks.len()),
         60,
     );
-    let (provider, gemini_key, ollama_url) = {
+    let embedding = {
         let c = state.db.lock().unwrap();
-        (
-            effective_embed_provider(&c),
-            repo::get_setting(&c, "gemini_api_key")?,
-            crate::homelab::resolved_setting(&c, "ollama_url"),
-        )
+        embedding_config(&c)?
     };
-    let embedder = embed::from_settings(&provider, gemini_key.as_deref(), ollama_url.as_deref());
+    let embedder = embed::from_config(&embedding);
     emit_progress(
         &app,
         &source_id,
@@ -1207,18 +1293,14 @@ pub async fn search_chunks(
     subject_id: Option<String>,
     k: Option<usize>,
 ) -> Result<Vec<ChunkHit>> {
-    let (provider, gemini_key, ollama_url) = {
+    let embedding = {
         let c = state.db.lock().unwrap();
-        (
-            effective_embed_provider(&c),
-            repo::get_setting(&c, "gemini_api_key")?,
-            crate::homelab::resolved_setting(&c, "ollama_url"),
-        )
+        embedding_config(&c)?
     };
     // Embed off the event-loop thread — embed() is a blocking network call, and a
     // sync command runs on the GTK thread (it would freeze the UI for the round-trip).
     let qvec = tauri::async_runtime::spawn_blocking(move || {
-        let embedder = embed::from_settings(&provider, gemini_key.as_deref(), ollama_url.as_deref());
+        let embedder = embed::from_config(&embedding);
         embedder.embed(&[query]).map(|mut v| v.pop().unwrap_or_default())
     })
     .await
@@ -1236,13 +1318,9 @@ pub async fn global_search(state: State<'_, AppState>, query: String) -> Result<
     if query.is_empty() {
         return Ok(Vec::new());
     }
-    let (provider, gemini_key, ollama_url) = {
+    let embedding = {
         let c = state.db.lock().unwrap();
-        (
-            effective_embed_provider(&c),
-            repo::get_setting(&c, "gemini_api_key")?,
-            crate::homelab::resolved_setting(&c, "ollama_url"),
-        )
+        embedding_config(&c)?
     };
     let mut hits: Vec<SearchHit> = Vec::new();
 
@@ -1259,7 +1337,7 @@ pub async fn global_search(state: State<'_, AppState>, query: String) -> Result<
     // embedder — its hash vectors rank essentially at random.
     let q = query.clone();
     let qvec: Option<Vec<f32>> = tauri::async_runtime::spawn_blocking(move || {
-        let embedder = embed::from_settings(&provider, gemini_key.as_deref(), ollama_url.as_deref());
+        let embedder = embed::from_config(&embedding);
         if embedder.name() == "stub" {
             return None;
         }
@@ -1429,20 +1507,20 @@ pub async fn chat_answer(
 ) -> Result<ChatAnswer> {
     tauri::async_runtime::spawn_blocking(move || -> Result<ChatAnswer> {
     let state = app.state::<AppState>();
-    let (embed_provider, ollama_url, chat_spec, keys, preamble, searxng) = {
+    let (embedding, chat_spec, keys, preamble, searxng, language) = {
         let c = state.db.lock().unwrap();
-        // DEFAULT_CHAT_MODEL is a fast non-reasoning model (see its doc comment for why
-        // chat must not fall back to a reasoning model like Step 3.7).
+        // DEFAULT_CHAT_MODEL is the fast default; compatible providers may still use
+        // the user's explicit thinking-effort setting (see its doc comment above).
         let chat_spec =
             repo::get_setting(&c, "model_chat")?.unwrap_or_else(|| DEFAULT_CHAT_MODEL.into());
         guard_offline_llm(&c, &chat_spec)?;
         (
-            effective_embed_provider(&c),
-            crate::homelab::resolved_setting(&c, "ollama_url"),
+            embedding_config(&c)?,
             chat_spec,
             read_keys(&c)?,
             profile_preamble(&c)?,
             searxng_base(&c)?,
+            output_language(&c),
         )
     };
     // Require a real model before doing any work.
@@ -1463,11 +1541,10 @@ pub async fn chat_answer(
     // vectors, so cosine search returns irrelevant chunks. In that case rely on
     // keyword search only. With a real embedder, run BOTH and merge by id so
     // retrieval is robust either way.
-    let embeddings_reliable = !embed_provider.is_empty() && embed_provider != "stub";
+    let embeddings_reliable = !embedding.provider.is_empty() && embedding.provider != "stub";
 
     let mut hits: Vec<ChunkHit> = if embeddings_reliable {
-        let embedder =
-            embed::from_settings(&embed_provider, keys.gemini.as_deref(), ollama_url.as_deref());
+        let embedder = embed::from_config(&embedding);
         let qvec = embedder.embed(&[query.clone()])?.pop().unwrap_or_default();
         let c = state.db.lock().unwrap();
         let mut vec_hits = repo::search_chunks(&c, Some(&subject_id), &qvec, 8)?;
@@ -1615,14 +1692,14 @@ pub async fn chat_answer(
              do not invent numbers.",
         );
     }
-    let system = system.as_str();
+    let system = llm::with_output_language(&system, &language);
     let user = if context.is_empty() {
         format!("(No indexed sources are in scope yet.){framework_block}{web_block}\n\nQUESTION: {query}")
     } else {
         format!("SOURCE CONTEXT:\n{context}{framework_block}{web_block}\n\nQUESTION: {query}")
     };
 
-    let text = model.complete(system, &user)?;
+    let text = model.complete(&system, &user)?;
 
     let citations = hits
         .iter()
@@ -2195,6 +2272,7 @@ const CHEATSHEET_MAP_SYSTEM: &str = "You are an exam-focused study-notes extract
 fn synthesize_bucket(
     model: &dyn llm::Llm,
     system: &str,
+    language: &str,
     scope_label: &str,
     sources: &[(String, String)],
 ) -> Result<(Vec<CsSection>, i64)> {
@@ -2209,9 +2287,10 @@ fn synthesize_bucket(
         }
     } else {
         let mut digests: Vec<String> = Vec::new();
+        let map_system = llm::with_output_language(CHEATSHEET_MAP_SYSTEM, language);
         for (title, text) in sources {
             let prompt = format!("SOURCE: {title}\n\n{text}\n\nProduce the exhaustive study digest now.");
-            match model.complete(CHEATSHEET_MAP_SYSTEM, &prompt) {
+            match model.complete(&map_system, &prompt) {
                 Ok(d) if !d.trim().is_empty() => {
                     digests.push(format!("### SOURCE: {title}\n\n{}", d.trim()));
                     used += 1;
@@ -2257,7 +2336,7 @@ pub async fn generate_cheatsheet(
 ) -> Result<CheatsheetData> {
     tauri::async_runtime::spawn_blocking(move || -> Result<CheatsheetData> {
     let state = app.state::<AppState>();
-    let (bucket, subject_name, topic_name, spec, keys, style, searxng) = {
+    let (bucket, subject_name, topic_name, spec, keys, style, searxng, language) = {
         let c = state.db.lock().unwrap();
         let subj = repo::get_subject(&c, &subject_id)?;
         let tname = match topic_id.as_deref() {
@@ -2290,7 +2369,7 @@ pub async fn generate_cheatsheet(
         let spec =
             repo::get_setting(&c, "model_cheatsheet")?.unwrap_or_else(|| "openrouter:deepseek/deepseek-v4-flash".into());
         guard_offline_llm(&c, &spec)?;
-        (bucket, subj.name, tname, spec, read_keys(&c)?, style_instruction(&c), searxng_base(&c)?)
+        (bucket, subj.name, tname, spec, read_keys(&c)?, style_instruction(&c), searxng_base(&c)?, output_language(&c))
     };
     let mut model = llm::from_spec_or_any(&spec, &keys).ok_or_else(|| Error::Other(NO_MODEL.into()))?;
     { let c = state.db.lock().unwrap(); apply_budget(&mut model, &c, "cheatsheet"); }
@@ -2376,13 +2455,13 @@ pub async fn generate_cheatsheet(
         REQUIRED so multiple topics merge cleanly. Omit ONLY \"Formulas & Rules\" or \"Worked \
         Examples\" when the sources genuinely contain none; never drop or rename the others.\n\
         {style}");
-    let system = system.as_str();
+    let system = llm::with_output_language(&system, &language);
     let scope = if topic_id.is_some() {
         format!("{subject_name} › {topic_name}")
     } else {
         format!("{subject_name} › General (ungrouped sources)")
     };
-    let (mut sections, sources_used) = synthesize_bucket(model.as_ref(), system, &scope, &bucket)?;
+    let (mut sections, sources_used) = synthesize_bucket(model.as_ref(), &system, &language, &scope, &bucket)?;
 
     // Illustrate only the sections the synthesis model flagged as genuinely
     // needing a diagram (image_query set) — so we don't burn a web search on
@@ -2724,7 +2803,7 @@ pub async fn generate_material(
             None => "Host".to_string(),
         }
     };
-    let (context, subject_name, topic_name, spec, keys, style, host_a, host_b) = {
+    let (context, subject_name, topic_name, spec, keys, style, host_a, host_b, language) = {
         let c = state.db.lock().unwrap();
         // The user's explicit source selection is authoritative: scope context to
         // exactly those sources (ignoring topic, since a selection can span topics).
@@ -2747,7 +2826,7 @@ pub async fn generate_material(
         guard_offline_llm(&c, &spec)?;
         let host_a = cap(repo::get_setting(&c, "voice_a")?.unwrap_or_else(|| "maya".into()));
         let host_b = cap(repo::get_setting(&c, "voice_b")?.unwrap_or_else(|| "theo".into()));
-        (ctx, subj.name, tname, spec, read_keys(&c)?, style_instruction(&c), host_a, host_b)
+        (ctx, subj.name, tname, spec, read_keys(&c)?, style_instruction(&c), host_a, host_b, output_language(&c))
     };
     let mut model = llm::from_spec_or_any(&spec, &keys).ok_or_else(|| Error::Other(NO_MODEL.into()))?;
     {
@@ -2844,10 +2923,10 @@ pub async fn generate_material(
     // Uniform guardrail: many models wrap JSON in ```json fences or add prose.
     // extract_json tolerates that, but instructing raw JSON makes it far more
     // reliable end-to-end (and avoids truncation from wasted fence tokens).
-    let system = format!(
+    let system = llm::with_output_language(&format!(
         "{system}{style} Respond with ONLY raw JSON — no markdown code fences, no prose before or after.{custom}",
         custom = custom_focus(custom_prompt.as_deref())
-    );
+    ), &language);
     let user = format!("Subject: {subject_name} › {topic_name}\n\nSOURCE MATERIAL:\n{context}\n\nGenerate now.");
 
     let raw = model.complete(&system, &user)?;
@@ -4327,15 +4406,11 @@ pub(crate) fn run_transcription_job(app: &AppHandle, source_id: &str) {
     // chunk + embed the transcript
     emit_progress(app, source_id, "chunking", "splitting transcript", 55);
     let chunks = ingest::chunk_text(&transcript, 900, 150);
-    let (embed_provider, gemini_key, ollama_url) = {
+    let embedding = {
         let c = state.db.lock().unwrap();
-        (
-            effective_embed_provider(&c),
-            repo::get_setting(&c, "gemini_api_key").ok().flatten(),
-            crate::homelab::resolved_setting(&c, "ollama_url"),
-        )
+        embedding_config(&c).unwrap_or_default()
     };
-    let embedder = embed::from_settings(&embed_provider, gemini_key.as_deref(), ollama_url.as_deref());
+    let embedder = embed::from_config(&embedding);
     emit_progress(app, source_id, "embedding", &format!("{} chunks", chunks.len()), 75);
     let vectors = match ingest::embed_chunks(embedder.as_ref(), &chunks) {
         Ok(v) => v,
@@ -4411,7 +4486,7 @@ fn spawn_lecture_summary(
 ) {
     std::thread::spawn(move || {
         let state = app.state::<AppState>();
-        let (spec, keys, offline) = {
+        let (spec, keys, offline, language) = {
             let c = state.db.lock().unwrap();
             let spec = match repo::get_setting(&c, "model_chat") {
                 Ok(Some(s)) => s,
@@ -4422,7 +4497,7 @@ fn spawn_lecture_summary(
                 Err(e) => { eprintln!("[summary] keys unavailable: {e}"); return; }
             };
             let offline = matches!(repo::get_setting(&c, "offline_mode"), Ok(Some(v)) if v == "true");
-            (spec, keys, offline)
+            (spec, keys, offline, output_language(&c))
         };
         if offline && !spec.starts_with("ollama") {
             return; // honor offline mode: only a local model may run
@@ -4436,6 +4511,7 @@ fn spawn_lecture_summary(
         let excerpt: String = transcript.chars().take(24_000).collect();
         let system = "You summarize lecture transcripts for a student's study notes. \
                       Be faithful to the transcript; do not invent content.";
+        let system = llm::with_output_language(system, &language);
         let user = format!(
             "Summarize this lecture transcript as Markdown with exactly these sections:\n\
              ## Key points — 5-10 tight bullets\n\
@@ -4443,7 +4519,7 @@ fn spawn_lecture_summary(
              ## Open questions — anything the lecturer left unresolved or flagged as exam-relevant (omit the section if none)\n\n\
              Transcript:\n{excerpt}"
         );
-        match model.complete(system, &user) {
+        match model.complete(&system, &user) {
             Ok(summary) if !summary.trim().is_empty() => {
                 let c = state.db.lock().unwrap();
                 if let Err(e) = repo::insert_note(

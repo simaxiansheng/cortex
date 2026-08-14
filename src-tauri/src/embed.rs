@@ -1,12 +1,23 @@
 //! Embedding providers behind a single trait. Default is the deterministic
-//! `stub` (no network, used until a real provider is configured). Locked design:
-//! embed-once with a local model (Ollama `nomic-embed-text`, $0) is the cost
-//! target; Gemini `text-embedding-004` is the BYOK cloud option. Provider is
-//! chosen from the `settings` table key `embed_provider`.
+//! `stub` (no network, used until a real provider is configured). The settings
+//! layer can select Gemini, OpenAI, Ollama, or any OpenAI-compatible embedding
+//! endpoint (for example Alibaba Cloud Model Studio / Bailian).
 
 use crate::error::{Error, Result};
 
 pub const STUB_DIM: usize = 256;
+
+/// Settings resolved by the command layer before an embedding request. Keeping
+/// this independent from SQLite makes every ingestion and search path share the
+/// same provider/model/credential selection without duplicating provider logic.
+#[derive(Debug, Clone, Default)]
+pub struct EmbedConfig {
+    pub provider: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub ollama_url: Option<String>,
+}
 
 pub trait Embedder: Send + Sync {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
@@ -63,6 +74,7 @@ impl Embedder for StubEmbedder {
 /// Gemini text-embedding-004 (BYOK). Requires `gemini_api_key` in settings.
 pub struct GeminiEmbedder {
     pub api_key: String,
+    pub model: String,
 }
 
 impl Embedder for GeminiEmbedder {
@@ -71,8 +83,8 @@ impl Embedder for GeminiEmbedder {
         // per 100 chunks instead of one per chunk.
         let client = reqwest::blocking::Client::new();
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key={}",
-            self.api_key
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:batchEmbedContents?key={}",
+            self.model, self.api_key
         );
         let mut out = Vec::with_capacity(texts.len());
         for batch in texts.chunks(100) {
@@ -80,7 +92,7 @@ impl Embedder for GeminiEmbedder {
                 .iter()
                 .map(|t| {
                     serde_json::json!({
-                        "model": "models/text-embedding-004",
+                        "model": format!("models/{}", self.model),
                         "content": { "parts": [{ "text": t }] }
                     })
                 })
@@ -124,6 +136,134 @@ impl Embedder for GeminiEmbedder {
     }
     fn name(&self) -> &'static str {
         "gemini"
+    }
+}
+
+/// OpenAI's `/embeddings` request/response format is also used by many hosted
+/// providers. This lets a user keep generation on one provider while using a
+/// different vector model such as Bailian's `text-embedding-v4`.
+pub struct OpenAiCompatEmbedder {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub label: &'static str,
+}
+
+impl OpenAiCompatEmbedder {
+    fn endpoint(&self) -> Result<String> {
+        let base = self.base_url.trim().trim_end_matches('/');
+        if base.is_empty() {
+            return Err(Error::Other(format!(
+                "{} embedding endpoint is empty — set it in Settings → API keys.",
+                self.label
+            )));
+        }
+        let endpoint = if base.ends_with("/embeddings") {
+            base.to_string()
+        } else {
+            format!("{base}/embeddings")
+        };
+        let url = reqwest::Url::parse(&endpoint).map_err(|_| {
+            Error::Other(format!(
+                "{} embedding endpoint must be a valid http:// or https:// URL",
+                self.label
+            ))
+        })?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(Error::Other(format!(
+                "{} embedding endpoint must use http:// or https://",
+                self.label
+            )));
+        }
+        Ok(endpoint)
+    }
+}
+
+impl Embedder for OpenAiCompatEmbedder {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let key = self.api_key.trim();
+        if key.is_empty() {
+            return Err(Error::Other(format!(
+                "{} embedding API key is empty — set it in Settings → API keys.",
+                self.label
+            )));
+        }
+        let client = reqwest::blocking::Client::new();
+        let url = self.endpoint()?;
+        let mut out = Vec::with_capacity(texts.len());
+
+        // The OpenAI-compatible contract accepts an array. Small batches are
+        // accepted by OpenAI, Bailian, and common self-hosted gateways alike.
+        for batch in texts.chunks(64) {
+            let resp = client
+                .post(&url)
+                .bearer_auth(key)
+                .json(&serde_json::json!({
+                    "model": self.model,
+                    "input": batch,
+                    "encoding_format": "float"
+                }))
+                .send()?;
+            if !resp.status().is_success() {
+                return Err(Error::Other(format!(
+                    "{} embedding failed: HTTP {}",
+                    self.label,
+                    resp.status()
+                )));
+            }
+            let json: serde_json::Value = resp.json()?;
+            let data = json["data"]
+                .as_array()
+                .ok_or_else(|| Error::Other(format!("{}: no embedding data", self.label)))?;
+            if data.len() != batch.len() {
+                return Err(Error::Other(format!(
+                    "{}: expected {} embeddings, got {}",
+                    self.label,
+                    batch.len(),
+                    data.len()
+                )));
+            }
+
+            // OpenAI returns an `index`; sort by it so a compliant server that
+            // reorders a batch still aligns every vector with its source chunk.
+            let mut ordered: Vec<(usize, &serde_json::Value)> = data
+                .iter()
+                .enumerate()
+                .map(|(fallback, item)| {
+                    let index = item["index"]
+                        .as_u64()
+                        .map(|n| n as usize)
+                        .unwrap_or(fallback);
+                    (index, item)
+                })
+                .collect();
+            ordered.sort_by_key(|(index, _)| *index);
+            for (_, item) in ordered {
+                let values = item["embedding"]
+                    .as_array()
+                    .ok_or_else(|| Error::Other(format!("{}: bad embedding shape", self.label)))?;
+                if values.is_empty() {
+                    return Err(Error::Other(format!("{}: empty embedding", self.label)));
+                }
+                out.push(
+                    values
+                        .iter()
+                        .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                        .collect(),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    // Compatible providers can expose different dimensions (and Bailian v4 can
+    // be configured with several). The actual vector length is stored per chunk;
+    // callers intentionally do not rely on this advisory value.
+    fn dim(&self) -> usize {
+        0
+    }
+    fn name(&self) -> &'static str {
+        "openai-compatible"
     }
 }
 
@@ -210,23 +350,52 @@ impl Embedder for OllamaEmbedder {
     }
 }
 
-/// Build an embedder from settings. Falls back to the stub on anything missing,
-/// so the app always works offline with zero configuration.
-pub fn from_settings(
-    provider: &str,
-    gemini_key: Option<&str>,
-    ollama_url: Option<&str>,
-) -> Box<dyn Embedder> {
-    match provider {
-        "gemini" => match gemini_key {
+/// Build an embedder from resolved settings. Falls back to the stub on missing
+/// credentials so the app always works offline with zero configuration.
+pub fn from_config(config: &EmbedConfig) -> Box<dyn Embedder> {
+    let model = config.model.trim();
+    match config.provider.as_str() {
+        "gemini" => match config.api_key.as_deref() {
             Some(k) if !k.is_empty() => Box::new(GeminiEmbedder {
                 api_key: k.to_string(),
+                model: if model.is_empty() {
+                    "text-embedding-004".to_string()
+                } else {
+                    model.to_string()
+                },
             }),
             _ => Box::new(StubEmbedder),
         },
+        "openai" | "custom" => match (config.api_key.as_deref(), config.base_url.as_deref()) {
+            (Some(key), Some(base_url)) if !key.trim().is_empty() && !base_url.trim().is_empty() => {
+                Box::new(OpenAiCompatEmbedder {
+                    base_url: base_url.to_string(),
+                    api_key: key.to_string(),
+                    model: if model.is_empty() {
+                        if config.provider == "openai" {
+                            "text-embedding-3-small".to_string()
+                        } else {
+                            "text-embedding-v4".to_string()
+                        }
+                    } else {
+                        model.to_string()
+                    },
+                    label: if config.provider == "openai" { "OpenAI" } else { "Custom" },
+                })
+            }
+            _ => Box::new(StubEmbedder),
+        },
         "ollama" => Box::new(OllamaEmbedder {
-            base_url: ollama_url.unwrap_or("http://localhost:11434").to_string(),
-            model: "nomic-embed-text".to_string(),
+            base_url: config
+                .ollama_url
+                .as_deref()
+                .unwrap_or("http://localhost:11434")
+                .to_string(),
+            model: if model.is_empty() {
+                "nomic-embed-text".to_string()
+            } else {
+                model.to_string()
+            },
         }),
         _ => Box::new(StubEmbedder),
     }
@@ -257,5 +426,30 @@ mod tests {
             .unwrap()[0];
         let far = &e.embed(&["the cat sat on the mat".into()]).unwrap()[0];
         assert!(cosine(q, close) > cosine(q, far));
+    }
+
+    #[test]
+    fn compatible_endpoint_accepts_https_and_local_http() {
+        let base = OpenAiCompatEmbedder {
+            base_url: "https://example.com/v1/".into(),
+            api_key: "test".into(),
+            model: "text-embedding-test".into(),
+            label: "Custom",
+        };
+        assert_eq!(base.endpoint().unwrap(), "https://example.com/v1/embeddings");
+        let full = OpenAiCompatEmbedder {
+            base_url: "https://example.com/v1/embeddings".into(),
+            ..base
+        };
+        assert_eq!(full.endpoint().unwrap(), "https://example.com/v1/embeddings");
+
+        let local = OpenAiCompatEmbedder {
+            base_url: "http://192.168.1.42:8000/v1".into(),
+            ..full
+        };
+        assert_eq!(
+            local.endpoint().unwrap(),
+            "http://192.168.1.42:8000/v1/embeddings"
+        );
     }
 }

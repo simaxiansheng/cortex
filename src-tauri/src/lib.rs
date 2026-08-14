@@ -44,17 +44,15 @@ fn show_main_window(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
-    // Desktop-only plugins. Single-instance (a second launch reveals/focuses the
-    // existing window instead of spawning another process) and the auto-updater
-    // don't exist on mobile, where the OS / app store handle those. Gated so the
-    // iOS/Android build links without them.
+    // Desktop-only single-instance guard. This local Chinese edition deliberately
+    // does not load the upstream auto-updater: an official Cortex release would
+    // otherwise replace this separately packaged, translated app.
     #[cfg(desktop)]
     {
         builder = builder
             .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
                 show_main_window(app);
-            }))
-            .plugin(tauri_plugin_updater::Builder::new().build());
+            }));
     }
     builder
         .plugin(tauri_plugin_dialog::init())
@@ -363,6 +361,7 @@ pub fn run() {
             commands::get_all_settings,
             commands::set_settings,
             commands::ollama_models,
+            commands::test_embedding,
             commands::verify_provider,
             commands::save_recording,
             commands::save_recording_raw,

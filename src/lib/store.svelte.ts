@@ -7,6 +7,7 @@ import type { Subject, Source } from "./api";
 import { music, BUILTIN_STATION_IDS, builtinStationUrl, builtinStationUrls } from "./music";
 import { keybinds } from "./keybinds.svelte";
 import { isMobile } from "./platform";
+import { setUiLocale } from "./i18n";
 
 export type View =
   | "dashboard"
@@ -720,6 +721,11 @@ class AppStore {
     // Restore preferences: theme, keybinds, and audio defaults.
     try {
       const all = await api.getAllSettings();
+      // The Chinese edition defaults to zh-CN. Language drives both the rendered
+      // interface and the backend's generated-output instruction.
+      const uiLocale = all["ui_language"] === "en" ? "en" : "zh-CN";
+      setUiLocale(uiLocale);
+      if (!all["ui_language"]) api.setSetting("ui_language", uiLocale).catch(() => {});
       // Follow Omarchy theme takes precedence when enabled — adopt the desktop's
       // current palette on every launch (and fall through if it can't be read).
       this.followOmarchy = all["follow_omarchy"] === "true";
@@ -1592,50 +1598,15 @@ class AppStore {
   }
 
   // ---- themed dialogs (confirm / prompt) ----
-  // Auto-updater: check the GitHub Releases endpoint, and on confirmation
-  // download + install + relaunch. `silent` suppresses the "up to date" / error
-  // toasts (used for an unobtrusive background check).
+  // This fork deliberately does not consume upstream updater releases: doing so
+  // would overwrite its Chinese UI and may merge it back into the official app.
   updateChecking = $state(false);
-  async checkForUpdates(silent = false) {
-    if (this.updateChecking) return;
-    this.updateChecking = true;
-    try {
-      const { check } = await import("@tauri-apps/plugin-updater");
-      const update = await check();
-      if (!update) {
-        if (!silent) this.pushToast({ kind: "success", title: "You're up to date", body: "Cortex is running the latest version." });
-        return;
-      }
-      // Linux package installs (deb/rpm/AUR) can't be self-updated — Tauri's updater only
-      // replaces AppImages. Point the user at their package manager instead of failing.
-      const kind = await api.installKind().catch(() => "unknown");
-      if (kind === "linux-package") {
-        this.pushToast({
-          kind: "info",
-          title: `Cortex ${update.version} is available`,
-          body: "You installed Cortex with your package manager — update it there (e.g. yay -Syu cortex-bin, sudo apt upgrade, or brew upgrade --cask cortex).",
-        });
-        return;
-      }
-      const ok = await this.confirm({
-        title: `Update to ${update.version}?`,
-        body: update.body?.trim() || "A new version of Cortex is available.",
-        okLabel: "Update & restart",
-      });
-      if (!ok) return;
-      this.pushToast({ kind: "info", title: "Downloading update…", body: "Cortex will restart when it's ready." });
-      try {
-        await update.downloadAndInstall();
-        const { relaunch } = await import("@tauri-apps/plugin-process");
-        await relaunch();
-      } catch (e) {
-        this.pushToast({ kind: "error", title: "Update failed to install", body: `Couldn't apply the update automatically: ${String(e)}. You can download the latest release manually from GitHub.` });
-      }
-    } catch (e) {
-      if (!silent) this.pushToast({ kind: "error", title: "Update check failed", body: String(e) });
-    } finally {
-      this.updateChecking = false;
-    }
+  async checkForUpdates() {
+    this.pushToast({
+      kind: "info",
+      title: "Custom Chinese edition",
+      body: "This edition does not install upstream Cortex updates automatically, so your Chinese interface and separate local data stay intact.",
+    });
   }
 
   #dialogResolve: ((v: any) => void) | null = null;

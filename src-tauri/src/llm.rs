@@ -5,6 +5,18 @@
 
 use crate::error::{Error, Result};
 
+/// Add the Chinese-edition default output language without touching source
+/// material. JSON keys, Markdown structure, code, formulas, and proper nouns
+/// remain stable so structured generation and parsing continue to work.
+pub fn with_output_language(system: &str, ui_language: &str) -> String {
+    if ui_language == "en" {
+        return system.to_string();
+    }
+    format!(
+        "{system}\n\nOUTPUT LANGUAGE: Use Simplified Chinese (zh-CN) for all newly generated natural-language text by default. If the user explicitly asks for another language, follow that request. Preserve required JSON keys and schema values, code, formulas, proper nouns, direct quotations, and Markdown structure. Do not translate the supplied source material itself."
+    )
+}
+
 pub trait Llm: Send + Sync {
     fn complete(&self, system: &str, user: &str) -> Result<String>;
     fn name(&self) -> String;
@@ -270,9 +282,53 @@ pub struct OpenAiCompatLlm {
     pub model: String,
     pub label: &'static str,
     pub max_tokens: Option<u32>,
+    /// User-selected reasoning level. `None` keeps the provider's own default.
+    pub reasoning_effort: Option<String>,
 }
 
 impl OpenAiCompatLlm {
+    /// Inject a reasoning request only when this provider has a compatible
+    /// request dialect. This keeps ordinary/custom OpenAI-compatible gateways
+    /// working unchanged, while enabling DeepSeek V4 and OpenRouter controls.
+    fn apply_reasoning(&self, body: &mut serde_json::Value) {
+        let Some(effort) = self.reasoning_effort.as_deref() else {
+            return;
+        };
+        if !matches!(effort, "off" | "low" | "medium" | "high" | "max") {
+            return;
+        }
+
+        let base = self.base_url.to_ascii_lowercase();
+        let model = self.model.to_ascii_lowercase();
+        let is_openrouter = self.label == "openrouter" || base.contains("openrouter.ai");
+        let is_deepseek_v4 = model.contains("deepseek-v4") || base.contains("api.deepseek.com");
+
+        if is_openrouter {
+            // OpenRouter's Chat Completions API accepts the portable `reasoning`
+            // object and adapts it to the concrete upstream model/provider.
+            body["reasoning"] = serde_json::json!({
+                "effort": if effort == "off" { "none" } else { effort }
+            });
+        } else if is_deepseek_v4 {
+            // DeepSeek V4's OpenAI-compatible endpoint uses both a thinking
+            // toggle and a high/max effort. It maps low and medium to high.
+            if effort == "off" {
+                body["thinking"] = serde_json::json!({ "type": "disabled" });
+            } else {
+                body["thinking"] = serde_json::json!({ "type": "enabled" });
+                body["reasoning_effort"] = serde_json::json!(
+                    if effort == "max" { "max" } else { "high" }
+                );
+            }
+        } else if self.label == "openai" {
+            // OpenAI reasoning models use this top-level field; its highest
+            // documented equivalent is xhigh rather than DeepSeek's max.
+            body["reasoning_effort"] = serde_json::json!(
+                if effort == "max" { "xhigh" } else if effort == "off" { "none" } else { effort }
+            );
+        }
+    }
+
     /// One chat/completions attempt with an explicit max_tokens (or none).
     fn complete_once(&self, system: &str, user: &str, max_tokens: Option<u32>) -> Result<String> {
         let key = self.api_key.trim();
@@ -289,6 +345,7 @@ impl OpenAiCompatLlm {
         if let Some(n) = max_tokens {
             body["max_tokens"] = serde_json::json!(n);
         }
+        self.apply_reasoning(&mut body);
         let json = send_json(
             self.label,
             client
@@ -451,6 +508,8 @@ pub struct Keys {
     pub custom_endpoint: Option<String>,
     /// Ollama base URL (e.g. http://localhost:11434) — local, keyless.
     pub ollama_url: Option<String>,
+    /// A non-secret, user preference shared by compatible reasoning providers.
+    pub reasoning_effort: Option<String>,
 }
 
 fn nonempty(o: &Option<String>) -> Option<&str> {
@@ -477,6 +536,7 @@ pub fn from_spec(spec: &str, keys: &Keys) -> Option<Box<dyn Llm>> {
                 model,
                 label: "openrouter",
                 max_tokens: None,
+                reasoning_effort: keys.reasoning_effort.clone(),
             }) as Box<dyn Llm>
         }),
         "openai" => nonempty(&keys.openai).map(|k| {
@@ -486,6 +546,7 @@ pub fn from_spec(spec: &str, keys: &Keys) -> Option<Box<dyn Llm>> {
                 model,
                 label: "openai",
                 max_tokens: None,
+                reasoning_effort: keys.reasoning_effort.clone(),
             }) as Box<dyn Llm>
         }),
         "claude" | "anthropic" => nonempty(&keys.claude).map(|k| {
@@ -498,6 +559,7 @@ pub fn from_spec(spec: &str, keys: &Keys) -> Option<Box<dyn Llm>> {
                 model,
                 label: "custom",
                 max_tokens: None,
+                reasoning_effort: keys.reasoning_effort.clone(),
             }) as Box<dyn Llm>
         }),
         // Ollama exposes an OpenAI-compatible API at <base>/v1; it's keyless, so
@@ -510,6 +572,7 @@ pub fn from_spec(spec: &str, keys: &Keys) -> Option<Box<dyn Llm>> {
                 model,
                 label: "ollama",
                 max_tokens: None,
+                reasoning_effort: None,
             }) as Box<dyn Llm>)
         }
         _ => None,
@@ -697,11 +760,61 @@ mod tests {
             model: "google/gemini-2.5-flash".into(),
             label: "openrouter",
             max_tokens: None,
+            reasoning_effort: None,
         };
         match llm.complete("You output JSON only.", "Return {\"ok\":true} and nothing else.") {
             Ok(t) => println!("LIVE OK: {}", truncate(&t, 200)),
             Err(e) => println!("LIVE ERR: {e}"),
         }
+    }
+
+    #[test]
+    fn reasoning_parameters_follow_provider_dialect() {
+        let openrouter = OpenAiCompatLlm {
+            base_url: "https://openrouter.ai/api/v1".into(),
+            api_key: "test".into(),
+            model: "deepseek/deepseek-v4-flash".into(),
+            label: "openrouter",
+            max_tokens: None,
+            reasoning_effort: Some("medium".into()),
+        };
+        let mut body = serde_json::json!({});
+        openrouter.apply_reasoning(&mut body);
+        assert_eq!(body["reasoning"]["effort"], "medium");
+
+        let deepseek = OpenAiCompatLlm {
+            base_url: "http://192.168.1.42:8000/v1".into(),
+            api_key: "test".into(),
+            model: "deepseek-v4-flash".into(),
+            label: "custom",
+            max_tokens: None,
+            reasoning_effort: Some("medium".into()),
+        };
+        let mut body = serde_json::json!({});
+        deepseek.apply_reasoning(&mut body);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "high");
+
+        let disabled = OpenAiCompatLlm {
+            reasoning_effort: Some("off".into()),
+            ..deepseek
+        };
+        let mut body = serde_json::json!({});
+        disabled.apply_reasoning(&mut body);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("reasoning_effort").is_none());
+
+        let openai = OpenAiCompatLlm {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "test".into(),
+            model: "gpt-5".into(),
+            label: "openai",
+            max_tokens: None,
+            reasoning_effort: Some("max".into()),
+        };
+        let mut body = serde_json::json!({});
+        openai.apply_reasoning(&mut body);
+        assert_eq!(body["reasoning_effort"], "xhigh");
     }
 
     #[test]
@@ -732,5 +845,13 @@ mod tests {
         let s = StubLlm;
         let out = s.complete("sys", "hello world").unwrap();
         assert!(out.contains("Offline draft"));
+    }
+
+    #[test]
+    fn chinese_output_instruction_preserves_structured_contracts() {
+        let system = with_output_language("Return raw JSON.", "zh-CN");
+        assert!(system.contains("Simplified Chinese"));
+        assert!(system.contains("JSON keys"));
+        assert_eq!(with_output_language("Return raw JSON.", "en"), "Return raw JSON.");
     }
 }

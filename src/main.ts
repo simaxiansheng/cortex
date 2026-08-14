@@ -7,6 +7,7 @@ import "./app.css";
 import "./styles/mobile.css";
 
 import { isMobile } from "./lib/platform";
+import { initializeUiLocale } from "./lib/i18n";
 
 // Apply the last-used theme BEFORE anything renders. The persisted theme lives
 // in the settings table (async — too late for first paint), so applyTheme also
@@ -35,6 +36,11 @@ try {
 // Tag the root on phones (and when the dev force-mobile flag is on) so the mobile
 // shell + mobile.css touch layer apply. Done before mount for a correct first paint.
 if (isMobile) document.documentElement.setAttribute("data-mobile", "");
+
+// This independent Chinese edition defaults to Simplified Chinese before Svelte
+// mounts, avoiding an English first-paint. The persisted setting is reconciled
+// once the local database is available during app init.
+initializeUiLocale();
 
 import { mount } from "svelte";
 import App from "./App.svelte";

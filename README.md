@@ -4,6 +4,8 @@
 
 # Cortex
 
+> **Chinese edition / 中文说明：** [README.zh-CN.md](README.zh-CN.md)
+
 **A local-first, open-source NotebookLM alternative — a desktop study OS for serious learners.**
 
 Ingest everything a course throws at you — slides, PDFs, docs, lecture recordings, web pages, YouTube — into a clean **Subjects → Topics → Sources** hierarchy, then turn it into exam-ready study material: cheatsheets, flashcards with spaced repetition, quizzes, two-host audio overviews, infographics, mind maps, and a citation-grounded chat.

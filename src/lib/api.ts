@@ -579,6 +579,8 @@ export const pingUrl = (url: string) => invoke<boolean>("ping_url", { url });
 
 /** Models actually installed on the configured Ollama server (local or homelab). Empty when unreachable / none pulled. */
 export const ollamaModels = () => invoke<string[]>("ollama_models");
+/** Test the currently selected vector provider with one harmless short string. */
+export const testEmbedding = () => invoke<string>("test_embedding");
 /** Lightweight authenticated probe of a provider's stored key/url. provider: gemini|openrouter|openai|claude|custom|ollama. */
 export interface VerifyResult { ok: boolean; detail: string }
 export const verifyProvider = (provider: string) =>
