@@ -349,6 +349,7 @@ export const backupStatus = () => invoke<BackupStatus>("backup_status");
 export const backupNow = () => invoke<string>("backup_now");
 /** Reclaim disk space (WAL checkpoint + VACUUM). */
 export const optimizeDb = () => invoke<void>("optimize_db", {});
+export type MaterialScope = "all" | "focus" | "tagged";
 export const generateMaterial = (
   subjectId: string,
   kind: "flashcards" | "quiz" | "audio" | "infographic" | "slideshow" | "mindmap",
@@ -356,8 +357,12 @@ export const generateMaterial = (
   title?: string,
   customPrompt?: string,
   sourceIds?: string[],
-  count?: number
-) => invoke<MaterialRec>("generate_material", { subjectId, kind, topicId, title, customPrompt, sourceIds, count });
+  count?: number,
+  scope?: MaterialScope,
+  focusTopics?: string
+) => invoke<MaterialRec>("generate_material", {
+  subjectId, kind, topicId, title, customPrompt, sourceIds, count, scope, focusTopics,
+});
 /** Synthesize a real audio-overview mp3 from the script segments via cloud TTS.
  *  Returns the file path (serve to <audio> with convertFileSrc). Errors offline /
  *  without an OpenAI key — caller falls back to on-device speech synthesis. */

@@ -450,6 +450,110 @@ fn custom_focus(custom: Option<&str>) -> String {
     }
 }
 
+/// A focused material request is deliberately narrower than a normal custom
+/// instruction. Before calling the generation model, retrieve only passages
+/// related to the student's target *inside the sources they selected*. This
+/// prevents a long, mixed-topic PDF from contributing unrelated quiz questions
+/// just because it happened to be checked in the launcher.
+const FOCUS_CHUNK_LIMIT: usize = 18;
+const FOCUS_CONTEXT_MAX_CHARS: usize = 24_000;
+const FOCUS_MIN_SEMANTIC_SCORE: f32 = 0.12;
+
+fn focused_material_context(
+    state: &AppState,
+    subject_id: &str,
+    source_ids: Option<&[String]>,
+    focus: &str,
+    embedding: &embed::EmbedConfig,
+) -> Result<String> {
+    let mut hits: Vec<ChunkHit> = Vec::new();
+
+    // A stub embedding is deterministic but not semantically meaningful. In
+    // that case use the exact-keyword path below, rather than pretending vector
+    // ranks can enforce a focus boundary.
+    let embedder = embed::from_config(embedding);
+    if embedder.name() != "stub" {
+        if let Ok(mut vectors) = embedder.embed(&[focus.to_string()]) {
+            if let Some(query_vec) = vectors.pop() {
+                let c = state.db.lock().unwrap();
+                let mut semantic_hits = match source_ids {
+                    Some(ids) => repo::search_chunks_in_sources(
+                        &c, subject_id, ids, &query_vec, FOCUS_CHUNK_LIMIT,
+                    )?,
+                    None => repo::search_chunks(&c, Some(subject_id), &query_vec, FOCUS_CHUNK_LIMIT)?,
+                };
+                // Keep a modest confidence floor. If nothing is genuinely
+                // related, fail closed below instead of handing arbitrary
+                // passages to the generator.
+                semantic_hits.retain(|hit| hit.score >= FOCUS_MIN_SEMANTIC_SCORE);
+                hits.append(&mut semantic_hits);
+            }
+        }
+    }
+
+    // Exact text matches complement semantic search and provide a usable strict
+    // fallback for older/stub indexes. De-duplicate by chunk id while retaining
+    // semantic hits first because they are ranked by the user's full intent.
+    let keyword_hits = {
+        let c = state.db.lock().unwrap();
+        match source_ids {
+            Some(ids) => repo::keyword_search_chunks_in_sources(
+                &c, subject_id, ids, focus, FOCUS_CHUNK_LIMIT,
+            )?,
+            None => repo::keyword_search_chunks(
+                &c,
+                Some(subject_id),
+                None,
+                focus,
+                FOCUS_CHUNK_LIMIT,
+            )?,
+        }
+    };
+    for hit in keyword_hits {
+        if !hits.iter().any(|existing| existing.id == hit.id) {
+            hits.push(hit);
+        }
+    }
+    hits.truncate(FOCUS_CHUNK_LIMIT);
+
+    if hits.is_empty() {
+        return Err(Error::Other(
+            "No source passages matched your focus. Try more specific terms, or re-ingest the selected sources with the current embedding model."
+                .into(),
+        ));
+    }
+
+    let mut context = format!(
+        "FOCUS TARGET: {focus}\n\nRETRIEVED FOCUS PASSAGES (use only these passages as evidence):\n\n"
+    );
+    let mut added = 0usize;
+    for hit in hits {
+        let text = hit.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let loc = hit
+            .loc
+            .as_deref()
+            .map(|loc| format!(" · {loc}"))
+            .unwrap_or_default();
+        let block = format!("SOURCE: {}{loc}\n{text}\n\n", hit.source_name);
+        if context.len() + block.len() > FOCUS_CONTEXT_MAX_CHARS && added > 0 {
+            continue;
+        }
+        context.push_str(&block);
+        added += 1;
+    }
+
+    if added == 0 {
+        return Err(Error::Other(
+            "No source passages matched your focus. Try more specific terms, or re-ingest the selected sources with the current embedding model."
+                .into(),
+        ));
+    }
+    Ok(context)
+}
+
 fn slug(s: &str) -> String {
     s.to_lowercase()
         .chars()
@@ -2786,9 +2890,32 @@ pub async fn generate_material(
     custom_prompt: Option<String>,
     source_ids: Option<Vec<String>>,
     count: Option<u32>,
+    scope: Option<String>,
+    focus_topics: Option<String>,
 ) -> Result<MaterialRec> {
     tauri::async_runtime::spawn_blocking(move || -> Result<MaterialRec> {
     let state = app.state::<AppState>();
+    // `all` keeps legacy behaviour. `focus` is a strict retrieval boundary;
+    // `tagged` is available for quiz/flashcard payloads and asks the model to
+    // label every generated item without narrowing the source material.
+    let scope = match scope.as_deref() {
+        Some("focus") => "focus",
+        Some("tagged") => "tagged",
+        _ => "all",
+    };
+    let focus_query = if scope == "focus" {
+        Some(
+            focus_topics
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| Error::Other("Enter at least one knowledge point to focus on.".into()))?,
+        )
+    } else {
+        None
+    };
+    let tag_items = scope == "tagged" && matches!(kind.as_str(), "quiz" | "flashcards");
     let setting_key = match kind.as_str() {
         "quiz" => "model_quiz",
         "audio" => "model_audio",
@@ -2803,13 +2930,16 @@ pub async fn generate_material(
             None => "Host".to_string(),
         }
     };
-    let (context, subject_name, topic_name, spec, keys, style, host_a, host_b, language) = {
+    let (base_context, subject_name, topic_name, spec, keys, style, host_a, host_b, language, embedding) = {
         let c = state.db.lock().unwrap();
         // The user's explicit source selection is authoritative: scope context to
         // exactly those sources (ignoring topic, since a selection can span topics).
         // Fall back to topic/subject scope only when nothing was selected.
         let has_sel = source_ids.as_ref().map_or(false, |v| !v.is_empty());
-        let (ctx, _) = if has_sel {
+        let (ctx, _) = if focus_query.is_some() {
+            // Focused context is retrieved below, outside this lock.
+            (String::new(), 0)
+        } else if has_sel {
             repo::context_text(&c, &subject_id, None, source_ids.as_deref(), 18000)?
         } else {
             repo::context_text(&c, &subject_id, topic_id.as_deref(), None, 18000)?
@@ -2826,7 +2956,32 @@ pub async fn generate_material(
         guard_offline_llm(&c, &spec)?;
         let host_a = cap(repo::get_setting(&c, "voice_a")?.unwrap_or_else(|| "maya".into()));
         let host_b = cap(repo::get_setting(&c, "voice_b")?.unwrap_or_else(|| "theo".into()));
-        (ctx, subj.name, tname, spec, read_keys(&c)?, style_instruction(&c), host_a, host_b, output_language(&c))
+        let embedding = focus_query
+            .as_ref()
+            .map(|_| embedding_config(&c))
+            .transpose()?;
+        (
+            ctx,
+            subj.name,
+            tname,
+            spec,
+            read_keys(&c)?,
+            style_instruction(&c),
+            host_a,
+            host_b,
+            output_language(&c),
+            embedding,
+        )
+    };
+    let context = match (focus_query.as_deref(), embedding.as_ref()) {
+        (Some(focus), Some(embedding)) => focused_material_context(
+            &state,
+            &subject_id,
+            source_ids.as_deref(),
+            focus,
+            embedding,
+        )?,
+        _ => base_context,
     };
     let mut model = llm::from_spec_or_any(&spec, &keys).ok_or_else(|| Error::Other(NO_MODEL.into()))?;
     {
@@ -2845,14 +3000,32 @@ pub async fn generate_material(
     // product limit: the chosen model's output budget is the practical constraint.
     let quiz_n = count.unwrap_or(9).max(3);
     let card_n = count.unwrap_or(14).max(4);
+    let item_tag_rule = if tag_items {
+        "\nTAGGING: Every generated item MUST include a `tags` array containing 1-3 concise, \
+         specific knowledge-point labels. Reuse consistent labels where concepts recur. Never use \
+         vague labels such as `general`, `miscellaneous`, or `question`."
+    } else {
+        ""
+    };
+    let strict_focus_rule = if focus_query.is_some() {
+        "\nSTRICT FOCUS SCOPE: The source material below contains only passages retrieved for the \
+         student's stated focus. Generate content ONLY about that focus and only from facts directly \
+         supported by those passages. Do not add background or adjacent topics just to fill space."
+    } else {
+        ""
+    };
 
     // Per-kind prompt + payload shape.
     let (system, default_title) = match kind.as_str() {
         "quiz" => (
             format!(
                 "You generate quiz questions from study material. Output ONLY a JSON array of \
-                 EXACTLY {quiz_n} items, each: {{\"q\":\"question\",\"options\":[\"a\",\"b\",\"c\",\"d\"],\
-                 \"answer\":<index 0-3>,\"explain\":\"why\"}}. No prose."
+                 EXACTLY {quiz_n} items, each: {item}. No prose.",
+                item = if tag_items {
+                    "{\"q\":\"question\",\"options\":[\"a\",\"b\",\"c\",\"d\"],\"answer\":<index 0-3>,\"explain\":\"why\",\"tags\":[\"topic tag\"]}"
+                } else {
+                    "{\"q\":\"question\",\"options\":[\"a\",\"b\",\"c\",\"d\"],\"answer\":<index 0-3>,\"explain\":\"why\"}"
+                }
             ),
             format!("{topic_name} quiz"),
         ),
@@ -2912,10 +3085,15 @@ pub async fn generate_material(
         _ => (
             format!(
                 "You generate study flashcards from material. Output ONLY a JSON array of EXACTLY \
-                 {card_n} items, each {{\"q\":\"front\",\"a\":\"back\"}}. Keep the \"a\" SHORT and \
+                 {card_n} items, each {item}. Keep the \"a\" SHORT and \
                  punchy — ideally one tight sentence or a few words (8-25 words max); never a \
                  paragraph. **bold** the single key term; use a short `- ` bullet list ONLY when \
-                 the answer is genuinely multi-part. No headings, no preamble, no prose outside the JSON."
+                 the answer is genuinely multi-part. No headings, no preamble, no prose outside the JSON.",
+                item = if tag_items {
+                    "{\"q\":\"front\",\"a\":\"back\",\"tags\":[\"topic tag\"]}"
+                } else {
+                    "{\"q\":\"front\",\"a\":\"back\"}"
+                }
             ),
             format!("{topic_name} flashcards"),
         ),
@@ -2924,10 +3102,14 @@ pub async fn generate_material(
     // extract_json tolerates that, but instructing raw JSON makes it far more
     // reliable end-to-end (and avoids truncation from wasted fence tokens).
     let system = llm::with_output_language(&format!(
-        "{system}{style} Respond with ONLY raw JSON — no markdown code fences, no prose before or after.{custom}",
+        "{system}{style}{strict_focus_rule}{item_tag_rule} Respond with ONLY raw JSON — no markdown code fences, no prose before or after.{custom}",
         custom = custom_focus(custom_prompt.as_deref())
     ), &language);
-    let user = format!("Subject: {subject_name} › {topic_name}\n\nSOURCE MATERIAL:\n{context}\n\nGenerate now.");
+    let focus_label = focus_query
+        .as_deref()
+        .map(|focus| format!("\nFOCUS TARGET: {focus}\n"))
+        .unwrap_or_default();
+    let user = format!("Subject: {subject_name} › {topic_name}{focus_label}\nSOURCE MATERIAL:\n{context}\n\nGenerate now.");
 
     let raw = model.complete(&system, &user)?;
     let payload = llm::extract_json(&raw)

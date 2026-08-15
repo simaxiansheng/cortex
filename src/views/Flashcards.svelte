@@ -5,9 +5,21 @@
   import Icon from "../components/Icon.svelte";
   import RichText from "../components/RichText.svelte";
 
-  let { onExit, deck: deckProp }: { onExit?: () => void; deck?: { q: string; a: string }[] } = $props();
+  type Flashcard = {
+    q: string;
+    a: string;
+    /** Present when generated with the "all content + item tags" scope. */
+    tags?: string[];
+  };
 
-  const deck = $derived(deckProp && deckProp.length > 0 ? deckProp : mock.flashcards);
+  let { onExit, deck: deckProp }: { onExit?: () => void; deck?: Flashcard[] } = $props();
+
+  const deck: Flashcard[] = $derived(
+    (deckProp && deckProp.length > 0 ? deckProp : mock.flashcards) as Flashcard[]
+  );
+  function tagsFor(tags?: string[]): string[] {
+    return (tags ?? []).filter((tag): tag is string => typeof tag === "string" && !!tag.trim()).slice(0, 3);
+  }
   // `q` is the SM-2 quality grade (0-5) sent to the scheduler.
   const RATINGS = [
     { id: "again", label: "Again", key: "1", cls: "again", q: 1 },
@@ -29,7 +41,7 @@
   // Reset whenever a new session starts so the review list stays per-session.
   let missed  = $state<number[]>([]);
   const missedCards = $derived(
-    missed.map((idx) => activeDeck[idx]).filter((c): c is { q: string; a: string } => !!c)
+    missed.map((idx) => activeDeck[idx]).filter((c): c is Flashcard => !!c)
   );
 
   // Review mode: null = normal deck, string[] = only fronts in this list
@@ -37,9 +49,9 @@
   // Cards due now per the SM-2 schedule (for the "Study due" affordance).
   let dueCount    = $state(0);
   // Active deck: review subset or full deck
-  let activeDeck = $derived(
+  const activeDeck: Flashcard[] = $derived(
     reviewKeys
-      ? reviewKeys.map((key) => deck.find((c) => c.q === key) ?? { q: key, a: "" })
+      ? reviewKeys.map((key): Flashcard => deck.find((c) => c.q === key) ?? { q: key, a: "" })
       : deck
   );
 
@@ -214,6 +226,13 @@
             {#each missedCards as card, idx (idx)}
               <li class="fc-review-item">
                 <div class="fc-review-q read"><RichText text={card.q} /></div>
+                {#if tagsFor(card.tags).length > 0}
+                  <div class="fc-topic-tags" aria-label="Topic tags">
+                    {#each tagsFor(card.tags) as tag, tagIndex (tag + tagIndex)}
+                      <span class="badge fc-topic-tag">{tag}</span>
+                    {/each}
+                  </div>
+                {/if}
                 <div class="fc-review-a-label mono">ANSWER</div>
                 <div class="fc-review-a read"><RichText text={card.a} /></div>
               </li>
@@ -282,6 +301,13 @@
     >
       <div class="fc-face fc-front">
         <div class="fc-side mono">QUESTION</div>
+        {#if tagsFor(activeDeck[i].tags).length > 0}
+          <div class="fc-topic-tags" aria-label="Topic tags">
+            {#each tagsFor(activeDeck[i].tags) as tag, tagIndex (tag + tagIndex)}
+              <span class="badge fc-topic-tag">{tag}</span>
+            {/each}
+          </div>
+        {/if}
         <div class="read fc-text"><RichText text={activeDeck[i].q} /></div>
         <div class="fc-hint mono">click or <span class="kbd">␣</span> to flip</div>
       </div>
@@ -366,4 +392,11 @@
   .fc-review-a :global(.rt-p) { margin: 0 0 var(--sp-1); }
   .fc-review-q :global(.rt-p:last-child),
   .fc-review-a :global(.rt-p:last-child) { margin-bottom: 0; }
+
+  .fc-topic-tags { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin: var(--sp-2) 0; }
+  .fc-topic-tag {
+    color: var(--accent);
+    border-color: color-mix(in oklab, var(--accent) 45%, transparent);
+    background: color-mix(in oklab, var(--accent) 12%, transparent);
+  }
 </style>

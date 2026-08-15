@@ -789,6 +789,74 @@ pub fn search_chunks(
     }
 }
 
+/// Cosine top-k restricted to an explicit set of sources. Material generation
+/// uses this instead of filtering an already-ranked subject-wide result: the
+/// source restriction is applied *before* ranking, so a large unrelated PDF can
+/// never crowd out a relevant passage from a selected one. This intentionally
+/// uses the tolerant Rust scan; focused material requests cover a bounded set of
+/// user-selected sources and it also works when a subject contains chunks created
+/// with different embedding dimensions.
+pub fn search_chunks_in_sources(
+    conn: &Connection,
+    subject_id: &str,
+    source_ids: &[String],
+    query_vec: &[f32],
+    k: usize,
+) -> Result<Vec<ChunkHit>> {
+    if source_ids.is_empty() {
+        return search_chunks(conn, Some(subject_id), query_vec, k);
+    }
+    if query_vec.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut sql = String::from(
+        "SELECT c.id, c.source_id, s.name, c.text, c.loc, c.embedding\n\
+         FROM chunks c JOIN sources s ON s.id=c.source_id\n\
+         WHERE c.subject_id = ? AND length(c.embedding) = ",
+    );
+    // This is derived solely from a vector length, never user input.
+    sql.push_str(&(query_vec.len() * std::mem::size_of::<f32>()).to_string());
+    sql.push_str(" AND c.source_id IN (");
+    for i in 0..source_ids.len() {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push('?');
+    }
+    sql.push(')');
+
+    let mut binds: Vec<String> = vec![subject_id.to_string()];
+    binds.extend(source_ids.iter().cloned());
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Vec<u8>>(5)?,
+        ))
+    })?;
+
+    let mut hits = Vec::new();
+    for row in rows {
+        let (id, source_id, source_name, text, loc, blob) = row?;
+        hits.push(ChunkHit {
+            id,
+            source_id,
+            source_name,
+            text,
+            loc,
+            score: cosine(query_vec, &blob_to_f32s(&blob)),
+        });
+    }
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.truncate(k);
+    Ok(hits)
+}
+
 /// sqlite-vec path: rank entirely in SQL via `vec_distance_cosine`. The
 /// `length` guard skips rows whose vector dimension differs from the query so a
 /// single mismatched blob can't error the whole query.
@@ -874,17 +942,33 @@ fn query_terms(query: &str) -> Vec<String> {
     ];
     let mut seen = std::collections::HashSet::new();
     let mut terms = Vec::new();
+    let mut add = |term: String| {
+        if term.len() < 3 || STOPWORDS.contains(&term.as_str()) || !seen.insert(term.clone()) {
+            return;
+        }
+        if terms.len() < 12 {
+            terms.push(term);
+        }
+    };
     for raw in query.split(|c: char| !c.is_alphanumeric()) {
         let t = raw.trim().to_lowercase();
-        if t.len() < 3 || STOPWORDS.contains(&t.as_str()) {
+        if t.is_empty() {
             continue;
         }
-        if seen.insert(t.clone()) {
-            terms.push(t);
+        // Chinese (and other CJK) phrases commonly have no spaces, so an exact
+        // phrase such as "如何找新词" is too brittle for a keyword fallback. Add
+        // short overlapping phrases too; semantic search remains the primary
+        // path, but this lets a stub/older index still find passages mentioning
+        // "新词" or "找新".
+        let chars: Vec<char> = t.chars().collect();
+        if chars.iter().any(|ch| matches!(*ch, '\u{4E00}'..='\u{9FFF}')) {
+            for width in [3usize, 2usize] {
+                for window in chars.windows(width) {
+                    add(window.iter().collect());
+                }
+            }
         }
-        if terms.len() >= 12 {
-            break;
-        }
+        add(t);
     }
     terms
 }
@@ -935,6 +1019,73 @@ pub fn keyword_search_chunks(
             loc,
             // Score = fraction of distinct query terms present, so it is
             // comparable in spirit to a cosine similarity in [0,1].
+            score: matched as f32 / terms.len() as f32,
+        });
+    }
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.truncate(k);
+    Ok(hits)
+}
+
+/// Keyword fallback with the same explicit multi-source boundary as
+/// [`search_chunks_in_sources`]. Keeping this boundary in SQL means focus mode
+/// remains strict even when the embedding provider is unavailable or sources were
+/// indexed with an older vector model.
+pub fn keyword_search_chunks_in_sources(
+    conn: &Connection,
+    subject_id: &str,
+    source_ids: &[String],
+    query: &str,
+    k: usize,
+) -> Result<Vec<ChunkHit>> {
+    if source_ids.is_empty() {
+        return keyword_search_chunks(conn, Some(subject_id), None, query, k);
+    }
+    let terms = query_terms(query);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut sql = String::from(
+        "SELECT c.id, c.source_id, s.name, c.text, c.loc\n\
+         FROM chunks c JOIN sources s ON s.id=c.source_id\n\
+         WHERE c.subject_id = ? AND c.source_id IN (",
+    );
+    for i in 0..source_ids.len() {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push('?');
+    }
+    sql.push(')');
+
+    let mut binds: Vec<String> = vec![subject_id.to_string()];
+    binds.extend(source_ids.iter().cloned());
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+
+    let mut hits = Vec::new();
+    for row in rows {
+        let (id, source_id, source_name, text, loc) = row?;
+        let lower = text.to_lowercase();
+        let matched = terms.iter().filter(|t| lower.contains(t.as_str())).count();
+        if matched == 0 {
+            continue;
+        }
+        hits.push(ChunkHit {
+            id,
+            source_id,
+            source_name,
+            text,
+            loc,
             score: matched as f32 / terms.len() as f32,
         });
     }

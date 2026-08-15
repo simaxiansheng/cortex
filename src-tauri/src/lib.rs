@@ -589,4 +589,54 @@ mod pipeline_tests {
         assert_eq!(subs[0].source_count, 1);
         assert_eq!(subs[0].topics[0].sources[0].name, "dp.md");
     }
+
+    #[test]
+    fn focused_retrieval_never_leaks_outside_selected_sources() {
+        let st = AppState::in_memory().unwrap();
+        let c = st.db.lock().unwrap();
+        let sid = repo::insert_subject(&c, "SEO research", None, None, None).unwrap();
+        let tid = repo::insert_topic(&c, &sid, "Keyword discovery", None, &[]).unwrap();
+        let wanted = repo::insert_source(&c, &sid, Some(&tid), "new-terms.pdf", "pdf", None).unwrap();
+        let excluded = repo::insert_source(&c, &sid, Some(&tid), "site-design.pdf", "pdf", None).unwrap();
+        let emb = embed::StubEmbedder;
+
+        let wanted_text = "Find emerging keywords by comparing search trends, community language, and competitor gaps.";
+        let excluded_text = "Choose a responsive layout, internal links, and a homepage information architecture.";
+        for (source_id, text) in [(&wanted, wanted_text), (&excluded, excluded_text)] {
+            let vector = emb.embed(&[text.to_string()]).unwrap().pop().unwrap();
+            repo::insert_chunk(
+                &c,
+                source_id,
+                &sid,
+                Some(&tid),
+                0,
+                text,
+                None,
+                vector.len() as i64,
+                &f32s_to_blob(&vector),
+            )
+            .unwrap();
+        }
+
+        let query = emb
+            .embed(&["how to find new keywords and validate trends".into()])
+            .unwrap()
+            .pop()
+            .unwrap();
+        let selected = vec![wanted.clone()];
+        let semantic = repo::search_chunks_in_sources(&c, &sid, &selected, &query, 8).unwrap();
+        assert!(!semantic.is_empty());
+        assert!(semantic.iter().all(|hit| hit.source_id == wanted));
+
+        let keyword = repo::keyword_search_chunks_in_sources(
+            &c,
+            &sid,
+            &selected,
+            "keyword trends competitor gaps",
+            8,
+        )
+        .unwrap();
+        assert!(!keyword.is_empty());
+        assert!(keyword.iter().all(|hit| hit.source_id == wanted));
+    }
 }

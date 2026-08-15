@@ -4,9 +4,24 @@
   import { app } from "../lib/store.svelte";
   import Icon from "../components/Icon.svelte";
 
-  let { onExit, questions: questionsProp }: { onExit?: () => void; questions?: { q: string; options: string[]; answer: number; explain: string }[] } = $props();
+  type QuizQuestion = {
+    q: string;
+    options: string[];
+    answer: number;
+    explain: string;
+    /** Present when generated with the "all content + item tags" scope. */
+    tags?: string[];
+  };
 
-  const qs = $derived(questionsProp && questionsProp.length > 0 ? questionsProp : mock.quiz);
+  let { onExit, questions: questionsProp }: { onExit?: () => void; questions?: QuizQuestion[] } = $props();
+
+  const qs: QuizQuestion[] = $derived(
+    (questionsProp && questionsProp.length > 0 ? questionsProp : mock.quiz) as QuizQuestion[]
+  );
+
+  function tagsFor(tags?: string[]): string[] {
+    return (tags ?? []).filter((tag): tag is string => typeof tag === "string" && !!tag.trim()).slice(0, 3);
+  }
 
   let i           = $state(0);
   let picked      = $state<number | null>(null);
@@ -18,9 +33,9 @@
   // Review mode: null = normal quiz, string[] = only these question texts
   let reviewKeys  = $state<string[] | null>(null);
   // Active question list: review subset or full quiz
-  const activeQs = $derived(
+  const activeQs: QuizQuestion[] = $derived(
     reviewKeys
-      ? reviewKeys.map((key) => qs.find((q) => q.q === key) ?? { q: key, options: [], answer: -1, explain: "" })
+      ? reviewKeys.map((key): QuizQuestion => qs.find((q) => q.q === key) ?? { q: key, options: [], answer: -1, explain: "" })
       : qs
   );
 
@@ -115,6 +130,13 @@
                   {gotIt ? "Correct" : "Revise"}
                 </span>
               </div>
+              {#if tagsFor(q.tags).length > 0}
+                <div class="qz-topic-tags" aria-label="Topic tags">
+                  {#each tagsFor(q.tags) as tag, tagIndex (tag + tagIndex)}
+                    <span class="badge qz-topic-tag">{tag}</span>
+                  {/each}
+                </div>
+              {/if}
 
               {#if q.options.length === 0}
                 <p class="mono muted qz-review-empty">
@@ -175,6 +197,13 @@
 
     <div class="quiz-card">
       <p class="quiz-q read">{q.q}</p>
+      {#if tagsFor(q.tags).length > 0}
+        <div class="qz-topic-tags" aria-label="Topic tags">
+          {#each tagsFor(q.tags) as tag, tagIndex (tag + tagIndex)}
+            <span class="badge qz-topic-tag">{tag}</span>
+          {/each}
+        </div>
+      {/if}
 
       <div class="quiz-opts">
         {#if q.options.length === 0}
@@ -288,6 +317,13 @@
   }
   .qz-review-mark.ok  { color: var(--ok); }
   .qz-review-mark.err { color: var(--err); }
+
+  .qz-topic-tags { display: flex; flex-wrap: wrap; gap: var(--sp-1); }
+  .qz-topic-tag {
+    color: var(--accent);
+    border-color: color-mix(in oklab, var(--accent) 45%, transparent);
+    background: color-mix(in oklab, var(--accent) 12%, transparent);
+  }
 
   .qz-review-opts { display: flex; flex-direction: column; gap: 7px; }
   .qz-review-opt {
