@@ -80,6 +80,21 @@ fn field_checksum(field: &str) -> i64 {
     u32::from_be_bytes([d[0], d[1], d[2], d[3]]) as i64
 }
 
+/// Stable Anki note GUID for one logical Cortex card. Anki uses note identity
+/// while importing a package, so keeping this deterministic lets a repeated
+/// export of the same material/front update the same logical note instead of
+/// looking like a brand-new random card every time.
+fn note_guid(identity: &str, front: &str) -> String {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let source = format!("cortex\u{001f}{identity}\u{001f}{}", strip_html(front));
+    let digest = sha1(source.as_bytes());
+    let mut guid = String::with_capacity(10);
+    for (idx, byte) in digest.iter().take(10).enumerate() {
+        guid.push(ALPHABET[(*byte as usize + idx * 17) % ALPHABET.len()] as char);
+    }
+    guid
+}
+
 /// Minimal HTML tag strip — fronts are usually plain text, but Anki computes the
 /// checksum on stripped content, so mirror that for stable dedupe.
 fn strip_html(s: &str) -> String {
@@ -204,8 +219,15 @@ CREATE INDEX ix_revlog_cid on revlog (cid);
 ";
 
 /// Build a `collection.anki2` SQLite file at `path` containing one Basic note +
-/// card per (front, back) pair, all in a deck named `deck_name`.
-fn build_collection(path: &Path, deck_name: &str, cards: &[(String, String)]) -> Result<()> {
+/// card per (front, back) pair, all in a deck named `deck_name`, with a separate
+/// stable identity seed. Direct Cortex → Anki hand-offs use a material id here,
+/// so renaming a material does not cause it to appear as different Anki notes.
+fn build_collection_with_identity(
+    path: &Path,
+    deck_name: &str,
+    cards: &[(String, String)],
+    identity: &str,
+) -> Result<()> {
     // Start from a clean file — a stale temp left by a crashed prior run would
     // already hold the `col` table and make CREATE TABLE fail ("already exists").
     let _ = std::fs::remove_file(path);
@@ -264,7 +286,7 @@ fn build_collection(path: &Path, deck_name: &str, cards: &[(String, String)]) ->
         let nid = now + 100 + idx as i64;
         let cid = now + 100_000 + idx as i64;
         let flds = format!("{front}\u{001f}{back}");
-        let guid = format!("crtx{:x}", nid); // unique within the file
+        let guid = note_guid(identity, front);
         conn.execute(
             "INSERT INTO notes (id,guid,mid,mod,usn,tags,flds,sfld,csum,flags,data)
              VALUES (?1,?2,?3,?4,-1,'',?5,?6,?7,0,'')",
@@ -284,12 +306,24 @@ fn build_collection(path: &Path, deck_name: &str, cards: &[(String, String)]) ->
 
 /// Build a complete `.apkg` for the given cards and write it to `dest`.
 pub fn export_apkg(dest: &Path, deck_name: &str, cards: &[(String, String)]) -> Result<()> {
+    export_apkg_with_identity(dest, deck_name, cards, deck_name)
+}
+
+/// Build an `.apkg` with a stable caller-supplied note identity. This is used
+/// when a Cortex material is directly opened in Anki; manual exports retain the
+/// deck-name identity used by [`export_apkg`].
+pub fn export_apkg_with_identity(
+    dest: &Path,
+    deck_name: &str,
+    cards: &[(String, String)],
+    identity: &str,
+) -> Result<()> {
     if cards.is_empty() {
         return Err(Error::Other("no flashcards to export".into()));
     }
     // Build collection.anki2 in a temp file, then read its bytes.
     let tmp = std::env::temp_dir().join(format!("cortex-anki-{}.anki2", temp_token()));
-    build_collection(&tmp, deck_name, cards)?;
+    build_collection_with_identity(&tmp, deck_name, cards, identity)?;
     let col_bytes = std::fs::read(&tmp).map_err(Error::Io)?;
     let _ = std::fs::remove_file(&tmp);
 
@@ -299,6 +333,101 @@ pub fn export_apkg(dest: &Path, deck_name: &str, cards: &[(String, String)]) -> 
     ]);
     std::fs::write(dest, zip).map_err(Error::Io)?;
     Ok(())
+}
+
+/// Escape a Cortex text field for Anki's HTML renderer while preserving line
+/// breaks. We intentionally leave Markdown syntax as plain text: existing Cortex
+/// cards use it, and Anki's Basic template does not understand Markdown.
+fn anki_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\n' => out.push_str("<br>"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Turn one Cortex material payload into Anki Basic front/back pairs. Flashcard
+/// materials preserve their question/answer shape; quiz materials become a
+/// self-testing card whose front shows the choices and whose back shows the
+/// correct answer and explanation. Other material kinds have no card semantics.
+pub fn cards_from_material(
+    kind: &str,
+    payload: &serde_json::Value,
+) -> Result<Vec<(String, String)>> {
+    let items = payload
+        .as_array()
+        .ok_or_else(|| Error::Other("material payload is not a card list".into()))?;
+    let cards: Vec<(String, String)> = match kind {
+        "flashcards" => items
+            .iter()
+            .filter_map(|item| {
+                let front = item["q"].as_str()?.trim();
+                let back = item["a"].as_str().unwrap_or("").trim();
+                (!front.is_empty()).then(|| (anki_html(front), anki_html(back)))
+            })
+            .collect(),
+        "quiz" => items
+            .iter()
+            .filter_map(|item| {
+                let question = item["q"].as_str()?.trim();
+                let options = item["options"].as_array()?;
+                let answer_index = item["answer"].as_u64()? as usize;
+                let answer = options.get(answer_index)?.as_str()?.trim();
+                if question.is_empty() || answer.is_empty() {
+                    return None;
+                }
+
+                let mut front = anki_html(question);
+                if !options.is_empty() {
+                    front.push_str("<br><br>");
+                    for (idx, option) in options.iter().enumerate() {
+                        let option = option.as_str().unwrap_or("").trim();
+                        if option.is_empty() {
+                            continue;
+                        }
+                        let letter = (b'A' + (idx % 26) as u8) as char;
+                        front.push_str(&format!("{letter}. {}<br>", anki_html(option)));
+                    }
+                }
+
+                let letter = (b'A' + (answer_index % 26) as u8) as char;
+                let mut back = format!(
+                    "<strong>正确答案：</strong>{letter}. {}",
+                    anki_html(answer)
+                );
+                if let Some(explain) = item["explain"].as_str().map(str::trim).filter(|v| !v.is_empty()) {
+                    back.push_str(&format!("<br><br><strong>解析：</strong>{}", anki_html(explain)));
+                }
+                let tags: Vec<String> = item["tags"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tag| tag.as_str().map(str::trim).filter(|tag| !tag.is_empty()))
+                    .map(anki_html)
+                    .collect();
+                if !tags.is_empty() {
+                    back.push_str(&format!("<br><br><small>标签：{}</small>", tags.join(" · ")));
+                }
+                Some((front, back))
+            })
+            .collect(),
+        other => {
+            return Err(Error::Other(format!(
+                "Anki import supports flashcards and quizzes (this is a {other} material)."
+            )))
+        }
+    };
+    if cards.is_empty() {
+        return Err(Error::Other("this material has no cards to send to Anki".into()));
+    }
+    Ok(cards)
 }
 
 // ===== IMPORT: read an `.apkg` into (deck name → cards) ======================
@@ -570,13 +699,45 @@ mod tests {
 
         // The embedded collection.anki2 must be a real SQLite DB with 2 notes/cards.
         let tmp = dir.join("roundtrip.anki2");
-        build_collection(&tmp, "Biology", &cards).unwrap();
+        build_collection_with_identity(&tmp, "Biology", &cards, "Biology").unwrap();
         let conn = Connection::open(&tmp).unwrap();
         let notes: i64 = conn.query_row("SELECT count(*) FROM notes", [], |r| r.get(0)).unwrap();
         let cnt: i64 = conn.query_row("SELECT count(*) FROM cards", [], |r| r.get(0)).unwrap();
         assert_eq!(notes, 2);
         assert_eq!(cnt, 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quiz_material_becomes_answerable_anki_cards() {
+        let payload = serde_json::json!([
+            {
+                "q": "Where should you look for new terms first?",
+                "options": ["Domain", "Blog comments", "Ads library", "Newsletter"],
+                "answer": 1,
+                "explain": "Comments show real user language.",
+                "tags": ["new terms", "research"]
+            }
+        ]);
+        let cards = cards_from_material("quiz", &payload).unwrap();
+        assert_eq!(cards.len(), 1);
+        assert!(cards[0].0.contains("A. Domain"));
+        assert!(cards[0].0.contains("B. Blog comments"));
+        assert!(cards[0].1.contains("正确答案：</strong>B. Blog comments"));
+        assert!(cards[0].1.contains("解析：</strong>Comments show real user language."));
+        assert!(cards[0].1.contains("标签：new terms · research"));
+    }
+
+    #[test]
+    fn note_guid_is_stable_per_deck_and_front() {
+        assert_eq!(
+            note_guid("Cortex::Research", "Find new terms"),
+            note_guid("Cortex::Research", "Find new terms")
+        );
+        assert_ne!(
+            note_guid("Cortex::Research", "Find new terms"),
+            note_guid("Cortex::Research", "Validate terms")
+        );
     }
 
     #[test]

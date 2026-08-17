@@ -2202,8 +2202,14 @@ pub async fn export_database(app: AppHandle, dest: String) -> Result<()> {
     .map_err(|e| Error::Other(format!("export task failed: {e}")))?
 }
 
-/// Export a flashcard material to an Anki `.apkg` deck at `dest`. Only flashcard
-/// materials are exportable (quiz/audio/etc. have no front/back shape).
+/// Turn a saved Cortex material into a named Anki deck. Flashcards retain their
+/// front/back content; quizzes are converted to self-testing cards by
+/// `anki::cards_from_material`.
+fn anki_cards_for_material(mat: &MaterialRec) -> Result<Vec<(String, String)>> {
+    crate::anki::cards_from_material(&mat.kind, &mat.payload)
+}
+
+/// Export a flashcard or quiz material to an Anki `.apkg` deck at `dest`.
 #[tauri::command]
 pub async fn export_anki(app: AppHandle, material_id: String, dest: String) -> Result<usize> {
     tauri::async_runtime::spawn_blocking(move || -> Result<usize> {
@@ -2212,36 +2218,69 @@ pub async fn export_anki(app: AppHandle, material_id: String, dest: String) -> R
             let c = state.db.lock().unwrap();
             repo::get_material(&c, &material_id)?
         };
-        if mat.kind != "flashcards" {
-            return Err(Error::Other(format!(
-                "Anki export only supports flashcard decks (this is a {} material).",
-                mat.kind
-            )));
-        }
-        // Flashcard payload: a JSON array of {"q":front,"a":back}.
-        let cards: Vec<(String, String)> = mat
-            .payload
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|c| {
-                let q = c["q"].as_str()?.trim();
-                let a = c["a"].as_str().unwrap_or("").trim();
-                if q.is_empty() {
-                    return None;
-                }
-                Some((q.to_string(), a.to_string()))
-            })
-            .collect();
-        if cards.is_empty() {
-            return Err(Error::Other("this deck has no cards to export".into()));
-        }
+        let cards = anki_cards_for_material(&mat)?;
         let deck_name = if mat.title.trim().is_empty() { "Cortex deck" } else { mat.title.trim() };
         crate::anki::export_apkg(std::path::Path::new(&dest), deck_name, &cards)?;
         Ok(cards.len())
     })
     .await
     .map_err(|e| Error::Other(format!("anki export task failed: {e}")))?
+}
+
+/// Send one Cortex flashcard/quiz material directly to the user's installed
+/// Anki desktop app. The `.apkg` is retained under Cortex's own app-data folder
+/// for recovery, then macOS LaunchServices hands that exact file to
+/// `/Applications/Anki.app` for its normal import flow. No add-on and no direct
+/// access to Anki's profile/database are required.
+#[tauri::command]
+pub async fn import_material_to_anki(app: AppHandle, material_id: String) -> Result<usize> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<usize> {
+        const ANKI_APP_PATH: &str = "/Applications/Anki.app";
+
+        if !std::path::Path::new(ANKI_APP_PATH).is_dir() {
+            return Err(Error::Other(
+                "Anki was not found at /Applications/Anki.app. Install Anki, then try again."
+                    .into(),
+            ));
+        }
+        let state = app.state::<AppState>();
+        let mat = {
+            let c = state.db.lock().unwrap();
+            repo::get_material(&c, &material_id)?
+        };
+        let cards = anki_cards_for_material(&mat)?;
+        let deck_title = if mat.title.trim().is_empty() {
+            "Cortex deck".to_string()
+        } else {
+            mat.title.trim().to_string()
+        };
+        let deck_name = format!("Cortex::{deck_title}");
+
+        // Keep the archive instead of deleting it after `open`: Anki receives the
+        // file asynchronously, and retaining a local copy also makes a failed
+        // import recoverable without regenerating the material.
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| Error::Other(e.to_string()))?
+            .join("anki_exports");
+        std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+        let dest = dir.join(format!("cortex-{material_id}-{}.apkg", crate::db::now_ms()));
+        crate::anki::export_apkg_with_identity(&dest, &deck_name, &cards, &material_id)?;
+
+        let status = std::process::Command::new("/usr/bin/open")
+            .arg("-a")
+            .arg(ANKI_APP_PATH)
+            .arg(&dest)
+            .status()
+            .map_err(|e| Error::Other(format!("could not launch Anki: {e}")))?;
+        if !status.success() {
+            return Err(Error::Other("Anki could not open the generated deck.".into()));
+        }
+        Ok(cards.len())
+    })
+    .await
+    .map_err(|e| Error::Other(format!("Anki import task failed: {e}")))?
 }
 
 /// Import an Anki `.apkg` deck file into this subject as flashcard materials —

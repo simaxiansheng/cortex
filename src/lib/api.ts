@@ -322,9 +322,12 @@ export const exportPdf = (html: string, dest: string) =>
 /** Copy the whole database to a portable .db file at `dest`. */
 export const exportDatabase = (dest: string) =>
   invoke<void>("export_database", { dest });
-/** Export a flashcard material to an Anki `.apkg` deck at `dest`; returns card count. */
+/** Export a flashcard or quiz material to an Anki `.apkg` deck at `dest`; returns card count. */
 export const exportAnki = (materialId: string, dest: string) =>
   invoke<number>("export_anki", { materialId, dest });
+/** Build an Anki deck and hand it directly to the installed Anki desktop app. */
+export const importMaterialToAnki = (materialId: string) =>
+  invoke<number>("import_material_to_anki", { materialId });
 /** Summary of an Anki `.apkg` import: decks created, cards stored, cards skipped. */
 export interface AnkiImportResult {
   deck_count: number;

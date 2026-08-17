@@ -97,6 +97,10 @@
     return ["flashcards", "quiz", "audio", "infographic", "slideshow", "mindmap"].includes(type);
   }
 
+  function isAnkiCompatible(type: string): boolean {
+    return type === "flashcards" || type === "quiz";
+  }
+
   function launchLabel(type: string): string {
     const map: Record<string, string> = {
       flashcards: "Study",
@@ -151,7 +155,7 @@
       app.pushToast({ kind: "error", title: "Delete failed", body: String(err) });
     }
   }
-  // Export a flashcard deck to an Anki .apkg via a native save dialog.
+  // Export a material to an Anki .apkg via a native save dialog.
   async function exportAnki(e: Event, m: Card) {
     e.stopPropagation();
     try {
@@ -166,6 +170,28 @@
       app.pushToast({ kind: "success", title: "Exported to Anki", body: `${n} card${n !== 1 ? "s" : ""} → ${dest}` });
     } catch (err) {
       app.pushToast({ kind: "error", title: "Anki export failed", body: String(err) });
+    }
+  }
+
+  // Direct hand-off: the Rust command builds an .apkg under Cortex's own data
+  // folder, then tells macOS to open it with /Applications/Anki.app. Keep this
+  // separate from the manual save-dialog export above.
+  let sendingToAnki = $state<string | null>(null);
+  async function importMaterialToAnki(e: Event, m: Card) {
+    e.stopPropagation();
+    if (sendingToAnki) return;
+    try {
+      sendingToAnki = m.id;
+      await api.importMaterialToAnki(m.id);
+      app.pushToast({
+        kind: "success",
+        title: "Sent to Anki",
+        body: "Anki is importing the generated deck.",
+      });
+    } catch (err) {
+      app.pushToast({ kind: "error", title: "Send to Anki failed", body: String(err) });
+    } finally {
+      sendingToAnki = null;
     }
   }
 
@@ -335,7 +361,16 @@
                     <span class="status-pill status-pill--{m.status === 'draft' ? 'draft' : 'ready'}">
                       <span class="dot"></span>
                     </span>
-                    {#if m.type === "flashcards"}
+                    {#if isAnkiCompatible(m.type)}
+                      <button
+                        class="btn btn--icon btn--sm btn--ghost mat-act"
+                        title="Import into Anki"
+                        aria-label="Import material into Anki"
+                        onclick={(e) => importMaterialToAnki(e, m)}
+                        disabled={sendingToAnki === m.id}
+                      >
+                        <Icon name="external" size={12} />
+                      </button>
                       <button class="btn btn--icon btn--sm btn--ghost mat-act" title="Export to Anki (.apkg)" aria-label="Export deck to Anki" onclick={(e) => exportAnki(e, m)}>
                         <Icon name="upload" size={12} />
                       </button>
