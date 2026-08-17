@@ -289,6 +289,11 @@ const MULTIPLE_CHOICE_TEMPLATE: AnkiTemplate = AnkiTemplate {
       if (!feedback || !answerData) return;
       feedback.classList.add(isCorrect ? 'cortex-feedback-correct' : 'cortex-feedback-wrong');
       feedback.innerHTML = (isCorrect ? '<strong>✓ 回答正确</strong>' : '<strong>✕ 回答错误</strong>') + answerData.innerHTML;
+      // Match Anki's own “Show Answer” button after a short confirmation beat,
+      // so its native Again/Hard/Good/Easy controls appear without a second tap.
+      window.setTimeout(function () {
+        if (typeof pycmd === 'function') pycmd('ans');
+      }, 550);
     });
   });
 })();
@@ -877,6 +882,7 @@ mod tests {
         let models: String = conn.query_row("SELECT models FROM col", [], |row| row.get(0)).unwrap();
         assert!(models.contains("Cortex Multiple Choice"));
         assert!(models.contains("cortex-choice"));
+        assert!(models.contains("pycmd('ans')"));
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_dir_all(&dir);
     }
