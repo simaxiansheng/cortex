@@ -421,6 +421,7 @@ pub fn run() {
             commands::synthesize_overview,
             commands::list_materials,
             commands::delete_material,
+            commands::delete_quiz_question,
             commands::rename_material,
             commands::add_citation,
             commands::list_citations,

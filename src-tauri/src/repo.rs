@@ -1432,6 +1432,73 @@ pub fn rename_material(conn: &Connection, id: &str, title: &str) -> Result<()> {
     Ok(())
 }
 
+/// Permanently remove one generated question from a quiz material. The payload
+/// and its lightweight card metadata are updated atomically; any review history
+/// for exactly that question is cleared so it cannot reappear in "review wrong"
+/// after the student has discarded it.
+pub fn delete_quiz_question(
+    conn: &Connection,
+    material_id: &str,
+    question_index: usize,
+) -> Result<MaterialRec> {
+    let material = get_material(conn, material_id)?;
+    if material.kind != "quiz" {
+        return Err(Error::Other(
+            "only questions in a quiz can be deleted individually".into(),
+        ));
+    }
+    let subject_id: String = conn.query_row(
+        "SELECT subject_id FROM materials WHERE id=?1",
+        params![material_id],
+        |r| r.get(0),
+    )?;
+    let mut questions = material
+        .payload
+        .as_array()
+        .cloned()
+        .ok_or_else(|| Error::Other("quiz payload is not a question list".into()))?;
+    if question_index >= questions.len() {
+        return Err(Error::NotFound(format!("quiz question {question_index}")));
+    }
+    let removed = questions.remove(question_index);
+    let question_key = removed
+        .get("q")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string);
+    let payload = serde_json::Value::Array(questions);
+    let meta = format!(
+        "{} questions",
+        payload.as_array().map(|items| items.len()).unwrap_or(0)
+    );
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE materials SET payload=?2, meta=?3 WHERE id=?1",
+        params![material_id, payload.to_string(), meta],
+    )?;
+    if let Some(question_key) = question_key {
+        // Current quiz sessions store the material id. The NULL branch cleans
+        // historical attempts made before quiz sessions carried that id, without
+        // touching a same-text question from another stored quiz.
+        tx.execute(
+            "DELETE FROM attempts
+             WHERE (material_id=?1 AND item_key=?2)
+                OR (material_id IS NULL AND subject_id=?3 AND kind='quiz' AND item_key=?2)",
+            params![material_id, question_key, subject_id],
+        )?;
+        tx.execute(
+            "DELETE FROM srs_cards
+             WHERE (material_id=?1 AND item_key=?2)
+                OR (material_id IS NULL AND subject_id=?3 AND kind='quiz' AND item_key=?2)",
+            params![material_id, question_key, subject_id],
+        )?;
+    }
+    tx.commit()?;
+    get_material(conn, material_id)
+}
+
 pub fn list_materials(conn: &Connection, subject_id: &str) -> Result<Vec<MaterialRec>> {
     let mut stmt = conn.prepare(
         "SELECT m.id, m.kind, m.title, m.meta, m.status, m.payload, t.name
@@ -3788,6 +3855,41 @@ mod tests {
         let wrong = wrong_items(&c, &sid, "quiz").unwrap();
         assert_eq!(wrong.len(), 1);
         assert_eq!(wrong[0].item_key, "Q2");
+    }
+
+    #[test]
+    fn deleting_quiz_question_persists_and_clears_its_review_history() {
+        let st = AppState::in_memory().unwrap();
+        let c = st.db.lock().unwrap();
+        let sid = insert_subject(&c, "Research", None, None, None).unwrap();
+        let payload = serde_json::json!([
+            { "q": "Discard me", "options": ["A"], "answer": 0, "explain": "" },
+            { "q": "Keep me", "options": ["B"], "answer": 0, "explain": "" }
+        ]);
+        let material = save_material(&c, &sid, None, "quiz", "Quiz", "2 questions", &payload).unwrap();
+        record_attempt(&c, &sid, Some(&material), "quiz", 0, "Discard me", false).unwrap();
+        // Historical releases did not attach a quiz material id. This row must
+        // disappear too, otherwise the discarded question would stay reviewable.
+        record_attempt(&c, &sid, None, "quiz", 0, "Discard me", false).unwrap();
+        record_attempt(&c, &sid, Some(&material), "quiz", 1, "Keep me", false).unwrap();
+
+        let updated = delete_quiz_question(&c, &material, 0).unwrap();
+        assert_eq!(updated.meta, "1 questions");
+        let questions = updated.payload.as_array().unwrap();
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0]["q"], "Keep me");
+
+        let wrong = wrong_items(&c, &sid, "quiz").unwrap();
+        assert_eq!(wrong.len(), 1);
+        assert_eq!(wrong[0].item_key, "Keep me");
+        let deleted_attempts: i64 = c
+            .query_row(
+                "SELECT count(*) FROM attempts WHERE item_key='Discard me'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted_attempts, 0);
     }
 
     #[test]

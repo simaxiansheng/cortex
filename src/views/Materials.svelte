@@ -114,6 +114,21 @@
     matLaunch = m;
   }
 
+  // Quiz can curate an individual generated question in place. Keep both the
+  // open player and the background material grid in sync without a full reload.
+  function updateLaunchedMaterial(updated: MaterialRec) {
+    const apply = (m: Card): Card => m.id === updated.id ? {
+      ...m,
+      title: updated.title,
+      topic: updated.topic,
+      meta: updated.meta,
+      status: updated.status,
+      payload: updated.payload,
+    } : m;
+    materials = materials.map(apply);
+    if (matLaunch?.id === updated.id) matLaunch = apply(matLaunch);
+  }
+
   async function renameMaterial(e: Event, m: Card) {
     e.stopPropagation();
     const name = await app.prompt({ title: "Rename material", label: "Name", value: m.title, placeholder: m.title });
@@ -196,6 +211,8 @@
   {:else if matLaunch.type === "quiz"}
     <Quiz
       onExit={() => (matLaunch = null)}
+      materialId={matLaunch.id}
+      onMaterialUpdated={updateLaunchedMaterial}
       questions={matLaunch.payload ?? undefined}
     />
   {:else if matLaunch.type === "audio"}

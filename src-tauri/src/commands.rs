@@ -3278,6 +3278,19 @@ pub fn delete_material(state: State<AppState>, id: String) -> Result<()> {
     repo::delete_material(&c, &id)
 }
 
+/// Remove one generated question while retaining the rest of its quiz. This is
+/// intentionally separate from deleting a whole material card so a student can
+/// curate weak AI-generated questions in place.
+#[tauri::command]
+pub fn delete_quiz_question(
+    state: State<AppState>,
+    material_id: String,
+    question_index: usize,
+) -> Result<MaterialRec> {
+    let c = state.db.lock().unwrap();
+    repo::delete_quiz_question(&c, &material_id, question_index)
+}
+
 #[tauri::command]
 pub fn rename_material(state: State<AppState>, id: String, title: String) -> Result<()> {
     let c = state.db.lock().unwrap();

@@ -374,6 +374,9 @@ export const synthesizeOverview = (
 export const listMaterials = (subjectId: string) =>
   invoke<MaterialRec[]>("list_materials", { subjectId });
 export const deleteMaterial = (id: string) => invoke<void>("delete_material", { id });
+/** Permanently remove one generated question while keeping the rest of its quiz. */
+export const deleteQuizQuestion = (materialId: string, questionIndex: number) =>
+  invoke<MaterialRec>("delete_quiz_question", { materialId, questionIndex });
 export const renameMaterial = (id: string, title: string) =>
   invoke<void>("rename_material", { id, title });
 
