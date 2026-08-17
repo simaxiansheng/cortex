@@ -322,9 +322,12 @@ export const exportPdf = (html: string, dest: string) =>
 /** Copy the whole database to a portable .db file at `dest`. */
 export const exportDatabase = (dest: string) =>
   invoke<void>("export_database", { dest });
-/** Export a flashcard material to an Anki `.apkg` deck at `dest`; returns card count. */
+/** Export a flashcard or quiz material to an Anki `.apkg` deck at `dest`; returns card count. */
 export const exportAnki = (materialId: string, dest: string) =>
   invoke<number>("export_anki", { materialId, dest });
+/** Build an Anki deck and hand it directly to the installed Anki desktop app. */
+export const importMaterialToAnki = (materialId: string) =>
+  invoke<number>("import_material_to_anki", { materialId });
 /** Summary of an Anki `.apkg` import: decks created, cards stored, cards skipped. */
 export interface AnkiImportResult {
   deck_count: number;
@@ -349,6 +352,7 @@ export const backupStatus = () => invoke<BackupStatus>("backup_status");
 export const backupNow = () => invoke<string>("backup_now");
 /** Reclaim disk space (WAL checkpoint + VACUUM). */
 export const optimizeDb = () => invoke<void>("optimize_db", {});
+export type MaterialScope = "all" | "focus" | "tagged";
 export const generateMaterial = (
   subjectId: string,
   kind: "flashcards" | "quiz" | "audio" | "infographic" | "slideshow" | "mindmap",
@@ -356,8 +360,12 @@ export const generateMaterial = (
   title?: string,
   customPrompt?: string,
   sourceIds?: string[],
-  count?: number
-) => invoke<MaterialRec>("generate_material", { subjectId, kind, topicId, title, customPrompt, sourceIds, count });
+  count?: number,
+  scope?: MaterialScope,
+  focusTopics?: string
+) => invoke<MaterialRec>("generate_material", {
+  subjectId, kind, topicId, title, customPrompt, sourceIds, count, scope, focusTopics,
+});
 /** Synthesize a real audio-overview mp3 from the script segments via cloud TTS.
  *  Returns the file path (serve to <audio> with convertFileSrc). Errors offline /
  *  without an OpenAI key — caller falls back to on-device speech synthesis. */
@@ -369,6 +377,9 @@ export const synthesizeOverview = (
 export const listMaterials = (subjectId: string) =>
   invoke<MaterialRec[]>("list_materials", { subjectId });
 export const deleteMaterial = (id: string) => invoke<void>("delete_material", { id });
+/** Permanently remove one generated question while keeping the rest of its quiz. */
+export const deleteQuizQuestion = (materialId: string, questionIndex: number) =>
+  invoke<MaterialRec>("delete_quiz_question", { materialId, questionIndex });
 export const renameMaterial = (id: string, title: string) =>
   invoke<void>("rename_material", { id, title });
 
@@ -579,6 +590,8 @@ export const pingUrl = (url: string) => invoke<boolean>("ping_url", { url });
 
 /** Models actually installed on the configured Ollama server (local or homelab). Empty when unreachable / none pulled. */
 export const ollamaModels = () => invoke<string[]>("ollama_models");
+/** Test the currently selected vector provider with one harmless short string. */
+export const testEmbedding = () => invoke<string>("test_embedding");
 /** Lightweight authenticated probe of a provider's stored key/url. provider: gemini|openrouter|openai|claude|custom|ollama. */
 export interface VerifyResult { ok: boolean; detail: string }
 export const verifyProvider = (provider: string) =>

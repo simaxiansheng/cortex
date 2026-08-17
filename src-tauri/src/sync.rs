@@ -432,7 +432,7 @@ fn is_syncable_setting(key: &str) -> bool {
     const ALLOW_EXACT: &[&str] = &[
         "theme", "follow_omarchy", "reading_font", "density", "default_station",
         "autoplay", "web_images_enabled", "exp_moodle", "cs_memory", "station_favs",
-        "host_voices",
+        "host_voices", "reasoning_effort",
     ];
     ALLOW_EXACT.contains(&key)
 }
@@ -943,7 +943,7 @@ mod tests {
         for k in [
             "theme", "density", "reading_font", "keybind_cmdk", "keybind_preset",
             "model_chat", "budget_cheatsheet", "pomo_workMin", "profile_name",
-            "default_station", "web_images_enabled", "cs_memory",
+            "default_station", "web_images_enabled", "cs_memory", "reasoning_effort",
         ] {
             assert!(is_syncable_setting(k), "{k} should sync");
             assert!(!is_credential_key(k), "{k} is a preference, not a credential");

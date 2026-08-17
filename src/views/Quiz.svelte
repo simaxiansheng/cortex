@@ -4,23 +4,49 @@
   import { app } from "../lib/store.svelte";
   import Icon from "../components/Icon.svelte";
 
-  let { onExit, questions: questionsProp }: { onExit?: () => void; questions?: { q: string; options: string[]; answer: number; explain: string }[] } = $props();
+  type QuizQuestion = {
+    q: string;
+    options: string[];
+    answer: number;
+    explain: string;
+    /** Present when generated with the "all content + item tags" scope. */
+    tags?: string[];
+  };
 
-  const qs = $derived(questionsProp && questionsProp.length > 0 ? questionsProp : mock.quiz);
+  let {
+    onExit,
+    questions: questionsProp,
+    materialId,
+    onMaterialUpdated,
+  }: {
+    onExit?: () => void;
+    questions?: QuizQuestion[];
+    materialId?: string;
+    onMaterialUpdated?: (material: api.MaterialRec) => void;
+  } = $props();
+
+  const qs: QuizQuestion[] = $derived(
+    (questionsProp !== undefined ? questionsProp : mock.quiz) as QuizQuestion[]
+  );
+
+  function tagsFor(tags?: string[]): string[] {
+    return (tags ?? []).filter((tag): tag is string => typeof tag === "string" && !!tag.trim()).slice(0, 3);
+  }
 
   let i           = $state(0);
   let picked      = $state<number | null>(null);
   let score       = $state(0);
   let done        = $state(false);
+  let deletingQuestion = $state(false);
   // Record of the option index the user picked, keyed by question index in activeQs.
   let answers     = $state<Record<number, number>>({});
 
   // Review mode: null = normal quiz, string[] = only these question texts
   let reviewKeys  = $state<string[] | null>(null);
   // Active question list: review subset or full quiz
-  const activeQs = $derived(
+  const activeQs: QuizQuestion[] = $derived(
     reviewKeys
-      ? reviewKeys.map((key) => qs.find((q) => q.q === key) ?? { q: key, options: [], answer: -1, explain: "" })
+      ? reviewKeys.map((key): QuizQuestion => qs.find((q) => q.q === key) ?? { q: key, options: [], answer: -1, explain: "" })
       : qs
   );
 
@@ -38,7 +64,7 @@
     // Record attempt (fire-and-forget; skip if no active subject)
     const sid = app.activeSubjectId;
     if (sid) {
-      api.recordAttempt(sid, "quiz", i, activeQs[i].q, isCorrect).catch((e: unknown) => {
+      api.recordAttempt(sid, "quiz", i, activeQs[i].q, isCorrect, materialId).catch((e: unknown) => {
         app.pushToast({ kind: "error", title: "Record failed", body: String(e) });
       });
     }
@@ -52,6 +78,51 @@
 
   function restart() {
     i = 0; picked = null; score = 0; done = false; reviewKeys = null; answers = {};
+  }
+
+  function answersAfterRemoving(index: number): Record<number, number> {
+    const next: Record<number, number> = {};
+    for (const [rawIndex, answer] of Object.entries(answers)) {
+      const itemIndex = Number(rawIndex);
+      if (!Number.isInteger(itemIndex) || itemIndex === index) continue;
+      next[itemIndex > index ? itemIndex - 1 : itemIndex] = answer;
+    }
+    return next;
+  }
+
+  async function deleteCurrentQuestion() {
+    if (!materialId || reviewKeys || deletingQuestion) return;
+    const question = activeQs[i];
+    if (!question) return;
+    const ok = await app.confirm({
+      title: "Delete this question?",
+      body: "It will be permanently removed from this quiz.",
+      danger: true,
+      okLabel: "Delete",
+    });
+    if (!ok) return;
+
+    deletingQuestion = true;
+    try {
+      const answeredCorrectly = answers[i] === question.answer;
+      const updated = await api.deleteQuizQuestion(materialId, i);
+      const remaining = Array.isArray(updated.payload) ? updated.payload as QuizQuestion[] : [];
+      onMaterialUpdated?.(updated);
+      if (answeredCorrectly) score = Math.max(0, score - 1);
+      answers = answersAfterRemoving(i);
+      picked = null;
+      if (remaining.length === 0) {
+        app.pushToast({ kind: "success", title: "Question deleted", body: "This quiz has no questions left." });
+        onExit?.();
+        return;
+      }
+      if (i >= remaining.length) i = remaining.length - 1;
+      app.pushToast({ kind: "success", title: "Question deleted" });
+    } catch (e) {
+      app.pushToast({ kind: "error", title: "Delete failed", body: String(e) });
+    } finally {
+      deletingQuestion = false;
+    }
   }
 
   async function startReview() {
@@ -72,7 +143,18 @@
 </script>
 
 <div class="fc-wrap">
-  {#if done}
+  {#if activeQs.length === 0}
+    <div class="fc-done">
+      <div class="fc-done-glyph"><Icon name="x" size={22} color="var(--err)" /></div>
+      <h2 class="read">No questions left</h2>
+      <p class="mono muted">This quiz has no questions. Go back to materials to delete the empty quiz or generate a new one.</p>
+      {#if onExit}
+        <button class="btn" onclick={onExit}>
+          <span style="display:inline-flex;transform:rotate(180deg)"><Icon name="chevron" size={12} /></span> Materials
+        </button>
+      {/if}
+    </div>
+  {:else if done}
     <div class="fc-done">
       <div class="fc-done-glyph">
         <Icon name="check" size={22} color="var(--ok)" />
@@ -115,6 +197,13 @@
                   {gotIt ? "Correct" : "Revise"}
                 </span>
               </div>
+              {#if tagsFor(q.tags).length > 0}
+                <div class="qz-topic-tags" aria-label="Topic tags">
+                  {#each tagsFor(q.tags) as tag, tagIndex (tag + tagIndex)}
+                    <span class="badge qz-topic-tag">{tag}</span>
+                  {/each}
+                </div>
+              {/if}
 
               {#if q.options.length === 0}
                 <p class="mono muted qz-review-empty">
@@ -162,6 +251,16 @@
         <div class="fc-bar" style:width="{(i / activeQs.length * 100)}%"></div>
       </div>
       {#if !done && !reviewKeys}
+        {#if materialId}
+          <button
+            class="btn btn--danger btn--sm"
+            onclick={deleteCurrentQuestion}
+            disabled={deletingQuestion}
+            title="Permanently delete this question from this quiz"
+          >
+            <Icon name="x" size={12} /> {deletingQuestion ? "Deleting…" : "Delete question"}
+          </button>
+        {/if}
         <button class="btn btn--sm" onclick={startReview} title="Review previously wrong answers">
           Review wrong answers
         </button>
@@ -175,6 +274,13 @@
 
     <div class="quiz-card">
       <p class="quiz-q read">{q.q}</p>
+      {#if tagsFor(q.tags).length > 0}
+        <div class="qz-topic-tags" aria-label="Topic tags">
+          {#each tagsFor(q.tags) as tag, tagIndex (tag + tagIndex)}
+            <span class="badge qz-topic-tag">{tag}</span>
+          {/each}
+        </div>
+      {/if}
 
       <div class="quiz-opts">
         {#if q.options.length === 0}
@@ -288,6 +394,13 @@
   }
   .qz-review-mark.ok  { color: var(--ok); }
   .qz-review-mark.err { color: var(--err); }
+
+  .qz-topic-tags { display: flex; flex-wrap: wrap; gap: var(--sp-1); }
+  .qz-topic-tag {
+    color: var(--accent);
+    border-color: color-mix(in oklab, var(--accent) 45%, transparent);
+    background: color-mix(in oklab, var(--accent) 12%, transparent);
+  }
 
   .qz-review-opts { display: flex; flex-direction: column; gap: 7px; }
   .qz-review-opt {

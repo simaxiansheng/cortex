@@ -18,11 +18,11 @@ const NO_MODEL: &str =
     "No model configured — add an API key in Settings → API keys (Gemini or OpenRouter), then pick it under Settings → Models.";
 
 /// Default for everything that reads the `model_chat` setting (chat, plus the
-/// auto-rename / transcript helpers). A fast NON-reasoning model: the chat path is
-/// blocking (total latency == perceived time-to-first-token) and must reliably emit
-/// the inline ⟦source · loc⟧ citation markers the UI renders. DeepSeek V4 Flash is the
-/// platform-wide default — very cheap ($0.09/$0.18 per Mtok), 1M context, fast and
-/// non-reasoning — falling back to any configured key (see llm::from_spec_or_any).
+/// auto-rename / transcript helpers). A fast default: the chat path is blocking
+/// (total latency == perceived time-to-first-token) and must reliably emit the inline
+/// ⟦source · loc⟧ citation markers the UI renders. DeepSeek V4 Flash remains the
+/// platform-wide default; compatible providers can apply the user-selected thinking
+/// effort. It falls back to any configured key (see llm::from_spec_or_any).
 const DEFAULT_CHAT_MODEL: &str = "openrouter:deepseek/deepseek-v4-flash";
 
 /// Default for the OCR / vision helper (`ocr_via_vision`). MUST be vision-capable —
@@ -81,8 +81,8 @@ pub(crate) fn guard_offline_llm(c: &Connection, spec: &str) -> Result<()> {
 }
 
 /// The embedding provider to actually use. In offline mode, cloud providers
-/// (gemini/openai) are downgraded to the local "stub" embedder so ingestion and
-/// retrieval keep working with zero network calls (Ollama embeddings stay local).
+/// are downgraded to the local "stub" embedder so ingestion and retrieval keep
+/// working with zero network calls (Ollama embeddings stay local).
 fn effective_embed_provider(c: &Connection) -> String {
     let p = repo::get_setting(c, "embed_provider")
         .ok()
@@ -92,6 +92,67 @@ fn effective_embed_provider(c: &Connection) -> String {
         "stub".into()
     } else {
         p
+    }
+}
+
+/// Resolve the vector provider once, then hand the same configuration to every
+/// ingestion and retrieval path. `model_embedding` is deliberately independent
+/// from text-generation models; a user can keep DeepSeek for chat and use an
+/// OpenAI-compatible vector endpoint such as Bailian for retrieval.
+pub(crate) fn embedding_config(c: &Connection) -> Result<embed::EmbedConfig> {
+    let provider = effective_embed_provider(c);
+    let default_model = match provider.as_str() {
+        "gemini" => "text-embedding-004",
+        "openai" => "text-embedding-3-small",
+        "ollama" => "nomic-embed-text",
+        "custom" => "text-embedding-v4",
+        _ => "",
+    };
+    let model = repo::get_setting(c, "model_embedding")?
+        .and_then(|raw| {
+            let (configured_provider, model) = raw.split_once(':')?;
+            (configured_provider == provider && !model.trim().is_empty())
+                .then(|| model.trim().to_string())
+        })
+        .unwrap_or_else(|| default_model.to_string());
+    let setting = |key: &str| -> Result<Option<String>> {
+        Ok(repo::get_setting(c, key)?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()))
+    };
+
+    let (api_key, base_url) = match provider.as_str() {
+        "gemini" => (setting("gemini_api_key")?, None),
+        "openai" => (setting("openai_api_key")?, Some("https://api.openai.com/v1".to_string())),
+        "custom" => {
+            // Keep the embedding credentials separate from a custom chat endpoint.
+            // The legacy generic custom values remain a safe fallback for existing
+            // installs that already used a single compatible provider for both.
+            let endpoint = setting("embed_custom_endpoint")?
+                .or(setting("custom_endpoint")?);
+            let key = setting("embed_custom_api_key")?
+                .or(setting("custom_api_key")?);
+            (key, endpoint)
+        }
+        _ => (None, None),
+    };
+
+    Ok(embed::EmbedConfig {
+        provider,
+        model,
+        api_key,
+        base_url,
+        ollama_url: crate::homelab::resolved_setting(c, "ollama_url"),
+    })
+}
+
+/// One setting drives both interface language and generated-output language in
+/// the standalone Chinese edition. Defaulting here keeps pre-existing databases
+/// Chinese even before the frontend has written its first preference value.
+pub(crate) fn output_language(c: &Connection) -> String {
+    match repo::get_setting(c, "ui_language") {
+        Ok(Some(value)) if value.trim() == "en" => "en".to_string(),
+        _ => "zh-CN".to_string(),
     }
 }
 
@@ -127,6 +188,9 @@ pub(crate) fn read_keys(c: &Connection) -> Result<llm::Keys> {
         // Resolve through the homelab fallback chain so Ollama chat also works
         // over Tailscale/public, not just on the LAN.
         ollama_url: crate::homelab::resolved_setting(c, "ollama_url"),
+        reasoning_effort: key("reasoning_effort")?.filter(|value| {
+            matches!(value.as_str(), "off" | "low" | "medium" | "high" | "max")
+        }),
     })
 }
 
@@ -176,6 +240,35 @@ pub async fn ollama_models(state: State<'_, AppState>) -> Result<Vec<String>> {
     })
     .await
     .unwrap_or_default())
+}
+
+/// Send one harmless short string through the selected embedding provider. This
+/// validates the real `/embeddings` contract (rather than a chat endpoint) and
+/// returns only provider/model/vector metadata — never a credential.
+#[tauri::command]
+pub async fn test_embedding(state: State<'_, AppState>) -> Result<String> {
+    let config = {
+        let c = state.db.lock().unwrap();
+        embedding_config(&c)?
+    };
+    if config.provider == "stub" {
+        return Err(Error::Other(
+            "No embedding provider is configured — choose one in Settings → Models first.".into(),
+        ));
+    }
+    let provider = config.provider.clone();
+    let model = config.model.clone();
+    let vector = tauri::async_runtime::spawn_blocking(move || {
+        let embedder = embed::from_config(&config);
+        embedder.embed(&["Cortex embedding connection test".to_string()])
+    })
+    .await
+    .map_err(|e| Error::Other(format!("embedding test task failed: {e}")))??;
+    let dim = vector.first().map(Vec::len).unwrap_or(0);
+    if dim == 0 {
+        return Err(Error::Other("Embedding provider returned an empty vector.".into()));
+    }
+    Ok(format!("{provider}:{model} · {dim} dimensions"))
 }
 
 /// Result of a provider connection check (Settings → API keys "verify").
@@ -355,6 +448,110 @@ fn custom_focus(custom: Option<&str>) -> String {
         ),
         None => String::new(),
     }
+}
+
+/// A focused material request is deliberately narrower than a normal custom
+/// instruction. Before calling the generation model, retrieve only passages
+/// related to the student's target *inside the sources they selected*. This
+/// prevents a long, mixed-topic PDF from contributing unrelated quiz questions
+/// just because it happened to be checked in the launcher.
+const FOCUS_CHUNK_LIMIT: usize = 18;
+const FOCUS_CONTEXT_MAX_CHARS: usize = 24_000;
+const FOCUS_MIN_SEMANTIC_SCORE: f32 = 0.12;
+
+fn focused_material_context(
+    state: &AppState,
+    subject_id: &str,
+    source_ids: Option<&[String]>,
+    focus: &str,
+    embedding: &embed::EmbedConfig,
+) -> Result<String> {
+    let mut hits: Vec<ChunkHit> = Vec::new();
+
+    // A stub embedding is deterministic but not semantically meaningful. In
+    // that case use the exact-keyword path below, rather than pretending vector
+    // ranks can enforce a focus boundary.
+    let embedder = embed::from_config(embedding);
+    if embedder.name() != "stub" {
+        if let Ok(mut vectors) = embedder.embed(&[focus.to_string()]) {
+            if let Some(query_vec) = vectors.pop() {
+                let c = state.db.lock().unwrap();
+                let mut semantic_hits = match source_ids {
+                    Some(ids) => repo::search_chunks_in_sources(
+                        &c, subject_id, ids, &query_vec, FOCUS_CHUNK_LIMIT,
+                    )?,
+                    None => repo::search_chunks(&c, Some(subject_id), &query_vec, FOCUS_CHUNK_LIMIT)?,
+                };
+                // Keep a modest confidence floor. If nothing is genuinely
+                // related, fail closed below instead of handing arbitrary
+                // passages to the generator.
+                semantic_hits.retain(|hit| hit.score >= FOCUS_MIN_SEMANTIC_SCORE);
+                hits.append(&mut semantic_hits);
+            }
+        }
+    }
+
+    // Exact text matches complement semantic search and provide a usable strict
+    // fallback for older/stub indexes. De-duplicate by chunk id while retaining
+    // semantic hits first because they are ranked by the user's full intent.
+    let keyword_hits = {
+        let c = state.db.lock().unwrap();
+        match source_ids {
+            Some(ids) => repo::keyword_search_chunks_in_sources(
+                &c, subject_id, ids, focus, FOCUS_CHUNK_LIMIT,
+            )?,
+            None => repo::keyword_search_chunks(
+                &c,
+                Some(subject_id),
+                None,
+                focus,
+                FOCUS_CHUNK_LIMIT,
+            )?,
+        }
+    };
+    for hit in keyword_hits {
+        if !hits.iter().any(|existing| existing.id == hit.id) {
+            hits.push(hit);
+        }
+    }
+    hits.truncate(FOCUS_CHUNK_LIMIT);
+
+    if hits.is_empty() {
+        return Err(Error::Other(
+            "No source passages matched your focus. Try more specific terms, or re-ingest the selected sources with the current embedding model."
+                .into(),
+        ));
+    }
+
+    let mut context = format!(
+        "FOCUS TARGET: {focus}\n\nRETRIEVED FOCUS PASSAGES (use only these passages as evidence):\n\n"
+    );
+    let mut added = 0usize;
+    for hit in hits {
+        let text = hit.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let loc = hit
+            .loc
+            .as_deref()
+            .map(|loc| format!(" · {loc}"))
+            .unwrap_or_default();
+        let block = format!("SOURCE: {}{loc}\n{text}\n\n", hit.source_name);
+        if context.len() + block.len() > FOCUS_CONTEXT_MAX_CHARS && added > 0 {
+            continue;
+        }
+        context.push_str(&block);
+        added += 1;
+    }
+
+    if added == 0 {
+        return Err(Error::Other(
+            "No source passages matched your focus. Try more specific terms, or re-ingest the selected sources with the current embedding model."
+                .into(),
+        ));
+    }
+    Ok(context)
 }
 
 fn slug(s: &str) -> String {
@@ -613,14 +810,14 @@ fn auto_rename_source(state: &State<AppState>, source_id: &str, original_name: &
     if text.trim().chars().count() < 80 {
         return; // too little content to name meaningfully
     }
-    let (spec, keys) = {
+    let (spec, keys, language) = {
         let c = state.db.lock().unwrap();
         let spec = match repo::get_setting(&c, "model_chat") {
             Ok(Some(s)) => s,
             _ => DEFAULT_CHAT_MODEL.to_string(),
         };
         match read_keys(&c) {
-            Ok(k) => (spec, k),
+            Ok(k) => (spec, k, output_language(&c)),
             Err(_) => return,
         }
     };
@@ -633,8 +830,9 @@ fn auto_rename_source(state: &State<AppState>, source_id: &str, original_name: &
         max 8 words, no quotes, no file extension, no trailing punctuation). If the original \
         filename contains a lecture/week/chapter/unit/topic number (e.g. \"Lecture 14\", \
         \"Week 3\"), KEEP that number in the title.";
+    let sys = llm::with_output_language(sys, &language);
     let user = format!("Original filename: {original_name}\n\nContent excerpt:\n{excerpt}\n\nTitle:");
-    let Ok(raw) = model.complete(sys, &user) else {
+    let Ok(raw) = model.complete(&sys, &user) else {
         return;
     };
     let title = raw
@@ -825,15 +1023,11 @@ pub async fn reingest_source(app: AppHandle, id: String) -> Result<IngestResult>
 
         emit_progress(&app, &id, "chunking", "splitting text", 50);
         let chunks = ingest::chunk_text(&text, 900, 150);
-        let (provider, gemini_key, ollama_url) = {
+        let embedding = {
             let c = state.db.lock().unwrap();
-            (
-                effective_embed_provider(&c),
-                repo::get_setting(&c, "gemini_api_key")?,
-                crate::homelab::resolved_setting(&c, "ollama_url"),
-            )
+            embedding_config(&c)?
         };
-        let embedder = embed::from_settings(&provider, gemini_key.as_deref(), ollama_url.as_deref());
+        let embedder = embed::from_config(&embedding);
         emit_progress(&app, &id, "embedding", &format!("{} chunks", chunks.len()), 70);
         let vectors = ingest::embed_chunks(embedder.as_ref(), &chunks)
             .or_else(|_| ingest::embed_chunks(&embed::StubEmbedder, &chunks))?;
@@ -1106,15 +1300,11 @@ pub async fn add_source(
         &format!("{} chunks", chunks.len()),
         60,
     );
-    let (provider, gemini_key, ollama_url) = {
+    let embedding = {
         let c = state.db.lock().unwrap();
-        (
-            effective_embed_provider(&c),
-            repo::get_setting(&c, "gemini_api_key")?,
-            crate::homelab::resolved_setting(&c, "ollama_url"),
-        )
+        embedding_config(&c)?
     };
-    let embedder = embed::from_settings(&provider, gemini_key.as_deref(), ollama_url.as_deref());
+    let embedder = embed::from_config(&embedding);
     emit_progress(
         &app,
         &source_id,
@@ -1207,18 +1397,14 @@ pub async fn search_chunks(
     subject_id: Option<String>,
     k: Option<usize>,
 ) -> Result<Vec<ChunkHit>> {
-    let (provider, gemini_key, ollama_url) = {
+    let embedding = {
         let c = state.db.lock().unwrap();
-        (
-            effective_embed_provider(&c),
-            repo::get_setting(&c, "gemini_api_key")?,
-            crate::homelab::resolved_setting(&c, "ollama_url"),
-        )
+        embedding_config(&c)?
     };
     // Embed off the event-loop thread — embed() is a blocking network call, and a
     // sync command runs on the GTK thread (it would freeze the UI for the round-trip).
     let qvec = tauri::async_runtime::spawn_blocking(move || {
-        let embedder = embed::from_settings(&provider, gemini_key.as_deref(), ollama_url.as_deref());
+        let embedder = embed::from_config(&embedding);
         embedder.embed(&[query]).map(|mut v| v.pop().unwrap_or_default())
     })
     .await
@@ -1236,13 +1422,9 @@ pub async fn global_search(state: State<'_, AppState>, query: String) -> Result<
     if query.is_empty() {
         return Ok(Vec::new());
     }
-    let (provider, gemini_key, ollama_url) = {
+    let embedding = {
         let c = state.db.lock().unwrap();
-        (
-            effective_embed_provider(&c),
-            repo::get_setting(&c, "gemini_api_key")?,
-            crate::homelab::resolved_setting(&c, "ollama_url"),
-        )
+        embedding_config(&c)?
     };
     let mut hits: Vec<SearchHit> = Vec::new();
 
@@ -1259,7 +1441,7 @@ pub async fn global_search(state: State<'_, AppState>, query: String) -> Result<
     // embedder — its hash vectors rank essentially at random.
     let q = query.clone();
     let qvec: Option<Vec<f32>> = tauri::async_runtime::spawn_blocking(move || {
-        let embedder = embed::from_settings(&provider, gemini_key.as_deref(), ollama_url.as_deref());
+        let embedder = embed::from_config(&embedding);
         if embedder.name() == "stub" {
             return None;
         }
@@ -1429,20 +1611,20 @@ pub async fn chat_answer(
 ) -> Result<ChatAnswer> {
     tauri::async_runtime::spawn_blocking(move || -> Result<ChatAnswer> {
     let state = app.state::<AppState>();
-    let (embed_provider, ollama_url, chat_spec, keys, preamble, searxng) = {
+    let (embedding, chat_spec, keys, preamble, searxng, language) = {
         let c = state.db.lock().unwrap();
-        // DEFAULT_CHAT_MODEL is a fast non-reasoning model (see its doc comment for why
-        // chat must not fall back to a reasoning model like Step 3.7).
+        // DEFAULT_CHAT_MODEL is the fast default; compatible providers may still use
+        // the user's explicit thinking-effort setting (see its doc comment above).
         let chat_spec =
             repo::get_setting(&c, "model_chat")?.unwrap_or_else(|| DEFAULT_CHAT_MODEL.into());
         guard_offline_llm(&c, &chat_spec)?;
         (
-            effective_embed_provider(&c),
-            crate::homelab::resolved_setting(&c, "ollama_url"),
+            embedding_config(&c)?,
             chat_spec,
             read_keys(&c)?,
             profile_preamble(&c)?,
             searxng_base(&c)?,
+            output_language(&c),
         )
     };
     // Require a real model before doing any work.
@@ -1463,11 +1645,10 @@ pub async fn chat_answer(
     // vectors, so cosine search returns irrelevant chunks. In that case rely on
     // keyword search only. With a real embedder, run BOTH and merge by id so
     // retrieval is robust either way.
-    let embeddings_reliable = !embed_provider.is_empty() && embed_provider != "stub";
+    let embeddings_reliable = !embedding.provider.is_empty() && embedding.provider != "stub";
 
     let mut hits: Vec<ChunkHit> = if embeddings_reliable {
-        let embedder =
-            embed::from_settings(&embed_provider, keys.gemini.as_deref(), ollama_url.as_deref());
+        let embedder = embed::from_config(&embedding);
         let qvec = embedder.embed(&[query.clone()])?.pop().unwrap_or_default();
         let c = state.db.lock().unwrap();
         let mut vec_hits = repo::search_chunks(&c, Some(&subject_id), &qvec, 8)?;
@@ -1615,14 +1796,14 @@ pub async fn chat_answer(
              do not invent numbers.",
         );
     }
-    let system = system.as_str();
+    let system = llm::with_output_language(&system, &language);
     let user = if context.is_empty() {
         format!("(No indexed sources are in scope yet.){framework_block}{web_block}\n\nQUESTION: {query}")
     } else {
         format!("SOURCE CONTEXT:\n{context}{framework_block}{web_block}\n\nQUESTION: {query}")
     };
 
-    let text = model.complete(system, &user)?;
+    let text = model.complete(&system, &user)?;
 
     let citations = hits
         .iter()
@@ -2021,8 +2202,29 @@ pub async fn export_database(app: AppHandle, dest: String) -> Result<()> {
     .map_err(|e| Error::Other(format!("export task failed: {e}")))?
 }
 
-/// Export a flashcard material to an Anki `.apkg` deck at `dest`. Only flashcard
-/// materials are exportable (quiz/audio/etc. have no front/back shape).
+/// Turn a saved Cortex material into a named Anki deck. Flashcards retain their
+/// front/back content; quizzes are converted to self-testing cards by
+/// `anki::cards_from_material`.
+fn anki_cards_for_material(mat: &MaterialRec) -> Result<Vec<(String, String)>> {
+    crate::anki::cards_from_material(&mat.kind, &mat.payload)
+}
+
+fn write_anki_material(
+    dest: &Path,
+    deck_name: &str,
+    material: &MaterialRec,
+    identity: &str,
+) -> Result<usize> {
+    let cards = anki_cards_for_material(material)?;
+    if material.kind == "quiz" {
+        crate::anki::export_quiz_apkg_with_identity(dest, deck_name, &cards, identity)?;
+    } else {
+        crate::anki::export_apkg_with_identity(dest, deck_name, &cards, identity)?;
+    }
+    Ok(cards.len())
+}
+
+/// Export a flashcard or quiz material to an Anki `.apkg` deck at `dest`.
 #[tauri::command]
 pub async fn export_anki(app: AppHandle, material_id: String, dest: String) -> Result<usize> {
     tauri::async_runtime::spawn_blocking(move || -> Result<usize> {
@@ -2031,36 +2233,73 @@ pub async fn export_anki(app: AppHandle, material_id: String, dest: String) -> R
             let c = state.db.lock().unwrap();
             repo::get_material(&c, &material_id)?
         };
-        if mat.kind != "flashcards" {
-            return Err(Error::Other(format!(
-                "Anki export only supports flashcard decks (this is a {} material).",
-                mat.kind
-            )));
-        }
-        // Flashcard payload: a JSON array of {"q":front,"a":back}.
-        let cards: Vec<(String, String)> = mat
-            .payload
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|c| {
-                let q = c["q"].as_str()?.trim();
-                let a = c["a"].as_str().unwrap_or("").trim();
-                if q.is_empty() {
-                    return None;
-                }
-                Some((q.to_string(), a.to_string()))
-            })
-            .collect();
-        if cards.is_empty() {
-            return Err(Error::Other("this deck has no cards to export".into()));
-        }
         let deck_name = if mat.title.trim().is_empty() { "Cortex deck" } else { mat.title.trim() };
-        crate::anki::export_apkg(std::path::Path::new(&dest), deck_name, &cards)?;
-        Ok(cards.len())
+        write_anki_material(Path::new(&dest), deck_name, &mat, deck_name)
     })
     .await
     .map_err(|e| Error::Other(format!("anki export task failed: {e}")))?
+}
+
+/// Send one Cortex flashcard/quiz material directly to the user's installed
+/// Anki desktop app. The `.apkg` is retained under Cortex's own app-data folder
+/// for recovery, then macOS LaunchServices hands that exact file to
+/// `/Applications/Anki.app` for its normal import flow. No add-on and no direct
+/// access to Anki's profile/database are required.
+#[tauri::command]
+pub async fn import_material_to_anki(app: AppHandle, material_id: String) -> Result<usize> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<usize> {
+        const ANKI_APP_PATH: &str = "/Applications/Anki.app";
+
+        if !std::path::Path::new(ANKI_APP_PATH).is_dir() {
+            return Err(Error::Other(
+                "Anki was not found at /Applications/Anki.app. Install Anki, then try again."
+                    .into(),
+            ));
+        }
+        let state = app.state::<AppState>();
+        let mat = {
+            let c = state.db.lock().unwrap();
+            repo::get_material(&c, &material_id)?
+        };
+        let deck_title = if mat.title.trim().is_empty() {
+            "Cortex deck".to_string()
+        } else {
+            mat.title.trim().to_string()
+        };
+        // Keep the upgraded interactive quiz note type in its own Anki subdeck.
+        // This prevents an older Cortex Basic quiz import from being mixed with
+        // the new clickable-choice cards when the student re-imports it.
+        let deck_name = if mat.kind == "quiz" {
+            format!("Cortex::选择题::{deck_title}")
+        } else {
+            format!("Cortex::{deck_title}")
+        };
+
+        // Keep the archive instead of deleting it after `open`: Anki receives the
+        // file asynchronously, and retaining a local copy also makes a failed
+        // import recoverable without regenerating the material.
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| Error::Other(e.to_string()))?
+            .join("anki_exports");
+        std::fs::create_dir_all(&dir).map_err(Error::Io)?;
+        let dest = dir.join(format!("cortex-{material_id}-{}.apkg", crate::db::now_ms()));
+        let card_count = write_anki_material(&dest, &deck_name, &mat, &material_id)?;
+
+        let status = std::process::Command::new("/usr/bin/open")
+            .arg("-a")
+            .arg(ANKI_APP_PATH)
+            .arg(&dest)
+            .status()
+            .map_err(|e| Error::Other(format!("could not launch Anki: {e}")))?;
+        if !status.success() {
+            return Err(Error::Other("Anki could not open the generated deck.".into()));
+        }
+        Ok(card_count)
+    })
+    .await
+    .map_err(|e| Error::Other(format!("Anki import task failed: {e}")))?
 }
 
 /// Import an Anki `.apkg` deck file into this subject as flashcard materials —
@@ -2195,6 +2434,7 @@ const CHEATSHEET_MAP_SYSTEM: &str = "You are an exam-focused study-notes extract
 fn synthesize_bucket(
     model: &dyn llm::Llm,
     system: &str,
+    language: &str,
     scope_label: &str,
     sources: &[(String, String)],
 ) -> Result<(Vec<CsSection>, i64)> {
@@ -2209,9 +2449,10 @@ fn synthesize_bucket(
         }
     } else {
         let mut digests: Vec<String> = Vec::new();
+        let map_system = llm::with_output_language(CHEATSHEET_MAP_SYSTEM, language);
         for (title, text) in sources {
             let prompt = format!("SOURCE: {title}\n\n{text}\n\nProduce the exhaustive study digest now.");
-            match model.complete(CHEATSHEET_MAP_SYSTEM, &prompt) {
+            match model.complete(&map_system, &prompt) {
                 Ok(d) if !d.trim().is_empty() => {
                     digests.push(format!("### SOURCE: {title}\n\n{}", d.trim()));
                     used += 1;
@@ -2257,7 +2498,7 @@ pub async fn generate_cheatsheet(
 ) -> Result<CheatsheetData> {
     tauri::async_runtime::spawn_blocking(move || -> Result<CheatsheetData> {
     let state = app.state::<AppState>();
-    let (bucket, subject_name, topic_name, spec, keys, style, searxng) = {
+    let (bucket, subject_name, topic_name, spec, keys, style, searxng, language) = {
         let c = state.db.lock().unwrap();
         let subj = repo::get_subject(&c, &subject_id)?;
         let tname = match topic_id.as_deref() {
@@ -2290,7 +2531,7 @@ pub async fn generate_cheatsheet(
         let spec =
             repo::get_setting(&c, "model_cheatsheet")?.unwrap_or_else(|| "openrouter:deepseek/deepseek-v4-flash".into());
         guard_offline_llm(&c, &spec)?;
-        (bucket, subj.name, tname, spec, read_keys(&c)?, style_instruction(&c), searxng_base(&c)?)
+        (bucket, subj.name, tname, spec, read_keys(&c)?, style_instruction(&c), searxng_base(&c)?, output_language(&c))
     };
     let mut model = llm::from_spec_or_any(&spec, &keys).ok_or_else(|| Error::Other(NO_MODEL.into()))?;
     { let c = state.db.lock().unwrap(); apply_budget(&mut model, &c, "cheatsheet"); }
@@ -2376,13 +2617,13 @@ pub async fn generate_cheatsheet(
         REQUIRED so multiple topics merge cleanly. Omit ONLY \"Formulas & Rules\" or \"Worked \
         Examples\" when the sources genuinely contain none; never drop or rename the others.\n\
         {style}");
-    let system = system.as_str();
+    let system = llm::with_output_language(&system, &language);
     let scope = if topic_id.is_some() {
         format!("{subject_name} › {topic_name}")
     } else {
         format!("{subject_name} › General (ungrouped sources)")
     };
-    let (mut sections, sources_used) = synthesize_bucket(model.as_ref(), system, &scope, &bucket)?;
+    let (mut sections, sources_used) = synthesize_bucket(model.as_ref(), &system, &language, &scope, &bucket)?;
 
     // Illustrate only the sections the synthesis model flagged as genuinely
     // needing a diagram (image_query set) — so we don't burn a web search on
@@ -2707,9 +2948,32 @@ pub async fn generate_material(
     custom_prompt: Option<String>,
     source_ids: Option<Vec<String>>,
     count: Option<u32>,
+    scope: Option<String>,
+    focus_topics: Option<String>,
 ) -> Result<MaterialRec> {
     tauri::async_runtime::spawn_blocking(move || -> Result<MaterialRec> {
     let state = app.state::<AppState>();
+    // `all` keeps legacy behaviour. `focus` is a strict retrieval boundary;
+    // `tagged` is available for quiz/flashcard payloads and asks the model to
+    // label every generated item without narrowing the source material.
+    let scope = match scope.as_deref() {
+        Some("focus") => "focus",
+        Some("tagged") => "tagged",
+        _ => "all",
+    };
+    let focus_query = if scope == "focus" {
+        Some(
+            focus_topics
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| Error::Other("Enter at least one knowledge point to focus on.".into()))?,
+        )
+    } else {
+        None
+    };
+    let tag_items = scope == "tagged" && matches!(kind.as_str(), "quiz" | "flashcards");
     let setting_key = match kind.as_str() {
         "quiz" => "model_quiz",
         "audio" => "model_audio",
@@ -2724,13 +2988,16 @@ pub async fn generate_material(
             None => "Host".to_string(),
         }
     };
-    let (context, subject_name, topic_name, spec, keys, style, host_a, host_b) = {
+    let (base_context, subject_name, topic_name, spec, keys, style, host_a, host_b, language, embedding) = {
         let c = state.db.lock().unwrap();
         // The user's explicit source selection is authoritative: scope context to
         // exactly those sources (ignoring topic, since a selection can span topics).
         // Fall back to topic/subject scope only when nothing was selected.
         let has_sel = source_ids.as_ref().map_or(false, |v| !v.is_empty());
-        let (ctx, _) = if has_sel {
+        let (ctx, _) = if focus_query.is_some() {
+            // Focused context is retrieved below, outside this lock.
+            (String::new(), 0)
+        } else if has_sel {
             repo::context_text(&c, &subject_id, None, source_ids.as_deref(), 18000)?
         } else {
             repo::context_text(&c, &subject_id, topic_id.as_deref(), None, 18000)?
@@ -2747,7 +3014,32 @@ pub async fn generate_material(
         guard_offline_llm(&c, &spec)?;
         let host_a = cap(repo::get_setting(&c, "voice_a")?.unwrap_or_else(|| "maya".into()));
         let host_b = cap(repo::get_setting(&c, "voice_b")?.unwrap_or_else(|| "theo".into()));
-        (ctx, subj.name, tname, spec, read_keys(&c)?, style_instruction(&c), host_a, host_b)
+        let embedding = focus_query
+            .as_ref()
+            .map(|_| embedding_config(&c))
+            .transpose()?;
+        (
+            ctx,
+            subj.name,
+            tname,
+            spec,
+            read_keys(&c)?,
+            style_instruction(&c),
+            host_a,
+            host_b,
+            output_language(&c),
+            embedding,
+        )
+    };
+    let context = match (focus_query.as_deref(), embedding.as_ref()) {
+        (Some(focus), Some(embedding)) => focused_material_context(
+            &state,
+            &subject_id,
+            source_ids.as_deref(),
+            focus,
+            embedding,
+        )?,
+        _ => base_context,
     };
     let mut model = llm::from_spec_or_any(&spec, &keys).ok_or_else(|| Error::Other(NO_MODEL.into()))?;
     {
@@ -2761,19 +3053,37 @@ pub async fn generate_material(
         ));
     }
 
-    // How many items to generate, when the kind is count-based. The user can set
-    // this in GenerateMaterial; clamp to a sane range so a bad value can't ask the
-    // model for 0 or 500 cards.
-    let quiz_n = count.unwrap_or(9).clamp(3, 30);
-    let card_n = count.unwrap_or(14).clamp(4, 40);
+    // How many items to generate, when the kind is count-based. Keep a minimum so
+    // an empty or invalid request still makes useful material, but do not impose a
+    // product limit: the chosen model's output budget is the practical constraint.
+    let quiz_n = count.unwrap_or(9).max(3);
+    let card_n = count.unwrap_or(14).max(4);
+    let item_tag_rule = if tag_items {
+        "\nTAGGING: Every generated item MUST include a `tags` array containing 1-3 concise, \
+         specific knowledge-point labels. Reuse consistent labels where concepts recur. Never use \
+         vague labels such as `general`, `miscellaneous`, or `question`."
+    } else {
+        ""
+    };
+    let strict_focus_rule = if focus_query.is_some() {
+        "\nSTRICT FOCUS SCOPE: The source material below contains only passages retrieved for the \
+         student's stated focus. Generate content ONLY about that focus and only from facts directly \
+         supported by those passages. Do not add background or adjacent topics just to fill space."
+    } else {
+        ""
+    };
 
     // Per-kind prompt + payload shape.
     let (system, default_title) = match kind.as_str() {
         "quiz" => (
             format!(
                 "You generate quiz questions from study material. Output ONLY a JSON array of \
-                 EXACTLY {quiz_n} items, each: {{\"q\":\"question\",\"options\":[\"a\",\"b\",\"c\",\"d\"],\
-                 \"answer\":<index 0-3>,\"explain\":\"why\"}}. No prose."
+                 EXACTLY {quiz_n} items, each: {item}. No prose.",
+                item = if tag_items {
+                    "{\"q\":\"question\",\"options\":[\"a\",\"b\",\"c\",\"d\"],\"answer\":<index 0-3>,\"explain\":\"why\",\"tags\":[\"topic tag\"]}"
+                } else {
+                    "{\"q\":\"question\",\"options\":[\"a\",\"b\",\"c\",\"d\"],\"answer\":<index 0-3>,\"explain\":\"why\"}"
+                }
             ),
             format!("{topic_name} quiz"),
         ),
@@ -2833,10 +3143,15 @@ pub async fn generate_material(
         _ => (
             format!(
                 "You generate study flashcards from material. Output ONLY a JSON array of EXACTLY \
-                 {card_n} items, each {{\"q\":\"front\",\"a\":\"back\"}}. Keep the \"a\" SHORT and \
+                 {card_n} items, each {item}. Keep the \"a\" SHORT and \
                  punchy — ideally one tight sentence or a few words (8-25 words max); never a \
                  paragraph. **bold** the single key term; use a short `- ` bullet list ONLY when \
-                 the answer is genuinely multi-part. No headings, no preamble, no prose outside the JSON."
+                 the answer is genuinely multi-part. No headings, no preamble, no prose outside the JSON.",
+                item = if tag_items {
+                    "{\"q\":\"front\",\"a\":\"back\",\"tags\":[\"topic tag\"]}"
+                } else {
+                    "{\"q\":\"front\",\"a\":\"back\"}"
+                }
             ),
             format!("{topic_name} flashcards"),
         ),
@@ -2844,11 +3159,15 @@ pub async fn generate_material(
     // Uniform guardrail: many models wrap JSON in ```json fences or add prose.
     // extract_json tolerates that, but instructing raw JSON makes it far more
     // reliable end-to-end (and avoids truncation from wasted fence tokens).
-    let system = format!(
-        "{system}{style} Respond with ONLY raw JSON — no markdown code fences, no prose before or after.{custom}",
+    let system = llm::with_output_language(&format!(
+        "{system}{style}{strict_focus_rule}{item_tag_rule} Respond with ONLY raw JSON — no markdown code fences, no prose before or after.{custom}",
         custom = custom_focus(custom_prompt.as_deref())
-    );
-    let user = format!("Subject: {subject_name} › {topic_name}\n\nSOURCE MATERIAL:\n{context}\n\nGenerate now.");
+    ), &language);
+    let focus_label = focus_query
+        .as_deref()
+        .map(|focus| format!("\nFOCUS TARGET: {focus}\n"))
+        .unwrap_or_default();
+    let user = format!("Subject: {subject_name} › {topic_name}{focus_label}\nSOURCE MATERIAL:\n{context}\n\nGenerate now.");
 
     let raw = model.complete(&system, &user)?;
     let payload = llm::extract_json(&raw)
@@ -3015,6 +3334,19 @@ pub fn list_materials(state: State<AppState>, subject_id: String) -> Result<Vec<
 pub fn delete_material(state: State<AppState>, id: String) -> Result<()> {
     let c = state.db.lock().unwrap();
     repo::delete_material(&c, &id)
+}
+
+/// Remove one generated question while retaining the rest of its quiz. This is
+/// intentionally separate from deleting a whole material card so a student can
+/// curate weak AI-generated questions in place.
+#[tauri::command]
+pub fn delete_quiz_question(
+    state: State<AppState>,
+    material_id: String,
+    question_index: usize,
+) -> Result<MaterialRec> {
+    let c = state.db.lock().unwrap();
+    repo::delete_quiz_question(&c, &material_id, question_index)
 }
 
 #[tauri::command]
@@ -4327,15 +4659,11 @@ pub(crate) fn run_transcription_job(app: &AppHandle, source_id: &str) {
     // chunk + embed the transcript
     emit_progress(app, source_id, "chunking", "splitting transcript", 55);
     let chunks = ingest::chunk_text(&transcript, 900, 150);
-    let (embed_provider, gemini_key, ollama_url) = {
+    let embedding = {
         let c = state.db.lock().unwrap();
-        (
-            effective_embed_provider(&c),
-            repo::get_setting(&c, "gemini_api_key").ok().flatten(),
-            crate::homelab::resolved_setting(&c, "ollama_url"),
-        )
+        embedding_config(&c).unwrap_or_default()
     };
-    let embedder = embed::from_settings(&embed_provider, gemini_key.as_deref(), ollama_url.as_deref());
+    let embedder = embed::from_config(&embedding);
     emit_progress(app, source_id, "embedding", &format!("{} chunks", chunks.len()), 75);
     let vectors = match ingest::embed_chunks(embedder.as_ref(), &chunks) {
         Ok(v) => v,
@@ -4411,7 +4739,7 @@ fn spawn_lecture_summary(
 ) {
     std::thread::spawn(move || {
         let state = app.state::<AppState>();
-        let (spec, keys, offline) = {
+        let (spec, keys, offline, language) = {
             let c = state.db.lock().unwrap();
             let spec = match repo::get_setting(&c, "model_chat") {
                 Ok(Some(s)) => s,
@@ -4422,7 +4750,7 @@ fn spawn_lecture_summary(
                 Err(e) => { eprintln!("[summary] keys unavailable: {e}"); return; }
             };
             let offline = matches!(repo::get_setting(&c, "offline_mode"), Ok(Some(v)) if v == "true");
-            (spec, keys, offline)
+            (spec, keys, offline, output_language(&c))
         };
         if offline && !spec.starts_with("ollama") {
             return; // honor offline mode: only a local model may run
@@ -4436,6 +4764,7 @@ fn spawn_lecture_summary(
         let excerpt: String = transcript.chars().take(24_000).collect();
         let system = "You summarize lecture transcripts for a student's study notes. \
                       Be faithful to the transcript; do not invent content.";
+        let system = llm::with_output_language(system, &language);
         let user = format!(
             "Summarize this lecture transcript as Markdown with exactly these sections:\n\
              ## Key points — 5-10 tight bullets\n\
@@ -4443,7 +4772,7 @@ fn spawn_lecture_summary(
              ## Open questions — anything the lecturer left unresolved or flagged as exam-relevant (omit the section if none)\n\n\
              Transcript:\n{excerpt}"
         );
-        match model.complete(system, &user) {
+        match model.complete(&system, &user) {
             Ok(summary) if !summary.trim().is_empty() => {
                 let c = state.db.lock().unwrap();
                 if let Err(e) = repo::insert_note(

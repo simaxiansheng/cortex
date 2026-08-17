@@ -2,6 +2,7 @@
   import { app, THEMES, THEME_LABELS } from "../lib/store.svelte";
   import type { Theme } from "../lib/store.svelte";
   import { isMobile } from "../lib/platform";
+  import { getUiLocale, setUiLocale, type UiLocale } from "../lib/i18n";
   import * as api from "../lib/api";
   import { getVersion } from "@tauri-apps/api/app";
   import type { Memory } from "../lib/api";
@@ -146,6 +147,7 @@
     { id: "gemini",  label: "Gemini",        models: [{ id: "text-embedding-004", label: "text-embedding-004" }] },
     { id: "openai",  label: "OpenAI",        models: [{ id: "text-embedding-3-small", label: "text-embedding-3-small — cheap" }, { id: "text-embedding-3-large", label: "text-embedding-3-large — best" }] },
     { id: "ollama",  label: "Ollama (local)", models: [{ id: "nomic-embed-text", label: "nomic-embed-text — local" }, { id: "mxbai-embed-large", label: "mxbai-embed-large — local" }] },
+    { id: "custom",  label: "Custom endpoint", models: [] },
   ];
   const MODEL_TASKS = [
     { id: "chat",       label: "Chat",                  desc: "Scoped Q&A across sources" },
@@ -200,10 +202,21 @@
 
   // ---- models state ----
   type TaskAssign = { provider: string; model: string; budget: string };
+  const REASONING_OPTIONS = [
+    { id: "default", label: "Provider default" },
+    { id: "off",     label: "Off" },
+    { id: "low",     label: "Low" },
+    { id: "medium",  label: "Medium" },
+    { id: "high",    label: "High" },
+    { id: "max",     label: "Maximum" },
+  ] as const;
+  type ReasoningEffort = typeof REASONING_OPTIONS[number]["id"];
+  let reasoningEffort = $state<ReasoningEffort>("default");
   // Defaults: DeepSeek V4 Flash (via OpenRouter) for ALL text generation —
-  // extremely cheap ($0.09/$0.18 per Mtok), 1M context, fast and non-reasoning.
+  // a fast default that can use the selected thinking effort where supported.
   // Falls back to any configured key if OpenRouter isn't set (see
-  // llm::from_spec_or_any). Embeddings stay on Gemini (DeepSeek doesn't embed).
+  // llm::from_spec_or_any). The default embedding provider is Gemini; it can be
+  // changed independently to OpenAI, Ollama, or an OpenAI-compatible endpoint.
   let assign = $state<Record<TaskId, TaskAssign>>({
     chat:       { provider: "openrouter", model: "deepseek/deepseek-v4-flash", budget: "8000" },
     cheatsheet: { provider: "openrouter", model: "deepseek/deepseek-v4-flash", budget: "32000" },
@@ -216,6 +229,22 @@
   function setTask(id: TaskId, patch: Partial<TaskAssign>) {
     assign = { ...assign, [id]: { ...assign[id], ...patch } };
   }
+  let embeddingTestState = $state<"idle" | "testing" | "ok" | "fail">("idle");
+  let embeddingTestDetail = $state("");
+  async function testEmbedding() {
+    if (embeddingTestState === "testing") return;
+    embeddingTestState = "testing";
+    embeddingTestDetail = "";
+    try {
+      embeddingTestDetail = await api.testEmbedding();
+      embeddingTestState = "ok";
+      app.pushToast({ kind: "success", title: "Embedding connected", body: embeddingTestDetail });
+    } catch (e) {
+      embeddingTestState = "fail";
+      embeddingTestDetail = String(e);
+      app.pushToast({ kind: "error", title: "Embedding test failed", body: embeddingTestDetail });
+    }
+  }
 
   // ---- keys state ----
   let keys = $state({
@@ -225,14 +254,18 @@
     openai: "",
     custom_endpoint: "",
     custom_api_key: "",
+    embed_custom_endpoint: "",
+    embed_custom_api_key: "",
   });
   const keyMeta = [
     { id: "openrouter", label: "OpenRouter",              note: "openrouter.ai/keys",    placeholder: "sk-or-…" },
     { id: "gemini",     label: "Gemini",                  note: "Google AI Studio",       placeholder: "AIza…" },
     { id: "claude",     label: "Claude",                  note: "console.anthropic.com",  placeholder: "sk-ant-…" },
     { id: "openai",     label: "OpenAI",                  note: "platform.openai.com",    placeholder: "sk-…" },
-    { id: "custom_endpoint", label: "Custom endpoint URL", note: "OpenAI-compatible base URL", placeholder: "https://…/v1" },
+    { id: "custom_endpoint", label: "Custom endpoint URL", note: "OpenAI-compatible HTTP(S) base URL. HTTP is allowed for localhost and LAN.", placeholder: "http://localhost:8000/v1 or https://…/v1" },
     { id: "custom_api_key", label: "Custom endpoint API key", note: "Bearer token for the custom endpoint", placeholder: "sk-…" },
+    { id: "embed_custom_endpoint", label: "Custom embedding endpoint URL", note: "OpenAI-compatible HTTP(S) base URL. HTTP is allowed for localhost and LAN. Bailian example: https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", placeholder: "http://localhost:8000/v1 or https://…/v1", verify: false },
+    { id: "embed_custom_api_key", label: "Custom embedding API key", note: "Used only for custom Embedding; kept separate from custom chat", placeholder: "sk-…", verify: false },
   ] as const;
   // show/hide per key
   let showKey = $state<Record<string, boolean>>({
@@ -242,6 +275,8 @@
     openai: false,
     custom_endpoint: false,
     custom_api_key: false,
+    embed_custom_endpoint: false,
+    embed_custom_api_key: false,
   });
 
   // ---- appearance state ----
@@ -259,6 +294,15 @@
   ];
   let readFont      = $state("mono");
   let density       = $state("regular");
+  let uiLanguage    = $state<UiLocale>(getUiLocale());
+
+  function chooseUiLanguage(next: UiLocale) {
+    uiLanguage = next;
+    setUiLocale(next);
+    api.setSetting("ui_language", next)
+      .then(() => app.pushToast({ kind: "success", title: "Language changed", body: "UI and new AI-generated content now follow this language." }))
+      .catch(() => app.pushToast({ kind: "error", title: "Save failed" }));
+  }
 
   // Settings is the ONLY view that mutates the <html> root. Writing an attribute on
   // documentElement invalidates styles for the ENTIRE document, forcing WebKit
@@ -975,9 +1019,12 @@
   }
 
   async function deleteEverything() {
-    const ok = window.confirm(
-      "Delete ALL data?\n\nThis wipes the local database — every subject, source, cheatsheet, and embedding. This cannot be undone. Your settings and API keys are kept.",
-    );
+    const ok = await app.confirm({
+      title: "Delete ALL data?",
+      body: "This wipes the local database — every subject, source, cheatsheet, and embedding. This cannot be undone. Your settings and API keys are kept.",
+      danger: true,
+      okLabel: "Delete all",
+    });
     if (!ok) return;
     try {
       await api.deleteAllData();
@@ -1004,6 +1051,8 @@
       if (s.openai_api_key)     keys = { ...keys, openai: s.openai_api_key };
       if (s.custom_endpoint)    keys = { ...keys, custom_endpoint: s.custom_endpoint };
       if (s.custom_api_key)     keys = { ...keys, custom_api_key: s.custom_api_key };
+      if (s.embed_custom_endpoint) keys = { ...keys, embed_custom_endpoint: s.embed_custom_endpoint };
+      if (s.embed_custom_api_key)  keys = { ...keys, embed_custom_api_key: s.embed_custom_api_key };
 
       // Models
       for (const taskId of ["chat","cheatsheet","audio","quiz","flashcard","embedding"] as TaskId[]) {
@@ -1024,6 +1073,7 @@
       if (s.embed_provider) {
         assign = { ...assign, embedding: { ...assign.embedding, provider: s.embed_provider } };
       }
+      if (isReasoningEffort(s.reasoning_effort)) reasoningEffort = s.reasoning_effort;
 
       // Local models + web search + remote whisper
       if (s.ollama_url)                    endpoint = s.ollama_url;
@@ -1063,6 +1113,10 @@
       // Appearance
       if (s.reading_font)   readFont      = s.reading_font;
       if (s.density)        density       = s.density;
+      if (s.ui_language === "en" || s.ui_language === "zh-CN") {
+        uiLanguage = s.ui_language;
+        setUiLocale(uiLanguage);
+      }
       // Window behaviour (default ON: closing hides to the tray)
       if (s.close_to_tray !== undefined) closeToTray = s.close_to_tray !== "false";
 
@@ -1123,6 +1177,8 @@
       openai_api_key:     keys.openai,
       custom_endpoint:    keys.custom_endpoint,
       custom_api_key:     keys.custom_api_key,
+      embed_custom_endpoint: keys.embed_custom_endpoint,
+      embed_custom_api_key:  keys.embed_custom_api_key,
     }).then(() => app.pushToast({ kind: "success", title: "Keys saved", body: "Stored in the system keychain." }))
       .catch(() => app.pushToast({ kind: "error", title: "Save failed" }));
   }
@@ -1161,6 +1217,16 @@
   function onModelChange(taskId: TaskId, m: string) {
     setTask(taskId, { model: m });
     api.setSettings({ [`model_${taskId}`]: assign[taskId].provider + ":" + m }).catch(() => {});
+  }
+
+  function isReasoningEffort(value: unknown): value is ReasoningEffort {
+    return typeof value === "string" && REASONING_OPTIONS.some((option) => option.id === value);
+  }
+
+  function setReasoningEffort(value: string) {
+    if (!isReasoningEffort(value)) return;
+    reasoningEffort = value;
+    api.setSettings({ reasoning_effort: value }).catch(() => {});
   }
 
   // ── Ollama: live installed-model list (GET /api/tags) ──────────────────────
@@ -1228,7 +1294,7 @@
   // Verify every provider that has a stored key (run on load + after Save keys).
   function verifyAllKeys() {
     for (const k of keyMeta) {
-      if (keys[k.id as keyof typeof keys]?.trim()) void verifyKey(k.id);
+      if (!("verify" in k && k.verify === false) && keys[k.id as keyof typeof keys]?.trim()) void verifyKey(k.id);
     }
     if (ollamaAvailable) void verifyKey("ollama");
   }
@@ -1486,10 +1552,36 @@ Notes: {about}</pre>
           {/each}
         </div>
 
+        <div class="set-card" style="margin-top:12px">
+          <div class="set-row">
+            <div>
+              <div class="set-row-t">Thinking effort</div>
+              <div class="set-row-d">Controls only providers with a supported reasoning API. DeepSeek V4 keeps low, maps medium and high to high, and maps maximum to max; OpenRouter forwards the selected effort.</div>
+            </div>
+            <Picker
+              value={reasoningEffort}
+              onChange={setReasoningEffort}
+              options={REASONING_OPTIONS.map((option) => ({ id: option.id, label: option.label }))}
+            />
+          </div>
+        </div>
+
         <div class="set-note mono">
           <Icon name="diamond" size={11} color="var(--accent)" />
           Ollama tasks run fully offline on this machine or your homelab — no key required.
         </div>
+        {#if assign.embedding.provider === "custom"}
+          <div class="set-note mono" style="margin-top:8px;align-items:flex-start">
+            <Icon name="globe" size={11} color="var(--accent)" />
+            <span>Custom Embedding uses its own endpoint and API key in API keys. It supports OpenAI-compatible providers such as Bailian: choose <span class="mono">text-embedding-v4</span>, save the endpoint and key, then test it.</span>
+            <button class="btn btn--ghost btn--sm" style="margin-left:auto;white-space:nowrap" onclick={testEmbedding} disabled={embeddingTestState === "testing"}>
+              {embeddingTestState === "testing" ? "Testing…" : "Test embedding"}
+            </button>
+          </div>
+          {#if embeddingTestDetail}
+            <div class={"set-note mono " + (embeddingTestState === "ok" ? "" : "faint")} style="margin-top:4px">{embeddingTestDetail}</div>
+          {/if}
+        {/if}
       </div>
 
     <!-- ===== API KEYS ===== -->
@@ -1506,13 +1598,14 @@ Notes: {about}</pre>
           <div class="set-card">
             {#each keyMeta as k}
               {@const isSet = !!keys[k.id as keyof typeof keys]}
+              {@const canVerify = !("verify" in k && k.verify === false)}
               {@const v = verify[verifyIdForKey(k.id)]}
               <div class="set-row stacked">
                 <div class="set-row-l">
                   <div class="set-row-t">
                     <span class="row-keytitle">
                       {k.label}
-                      <span class={statusClass(v)}>{statusLabel(v, isSet)}</span>
+                      <span class={statusClass(v)}>{canVerify ? statusLabel(v, isSet) : (isSet ? "saved" : "not set")}</span>
                     </span>
                   </div>
                   <div class="set-row-d">{k.note}</div>
@@ -1536,7 +1629,7 @@ Notes: {about}</pre>
                       <Icon name={showKey[k.id] ? "x" : "search"} size={13} />
                     </button>
                   </div>
-                  {#if isSet}
+                  {#if isSet && canVerify}
                     <div style="display:flex;gap:6px;margin-top:6px">
                       <button
                         type="button"
@@ -1613,6 +1706,24 @@ Notes: {about}</pre>
           <h1 class="set-title">Make it yours</h1>
           <p class="set-sub">Cortex re-skins live from your Omarchy theme, or pick one manually.</p>
         </header>
+
+        <section class="set-group">
+          <div class="set-group-h"><h3 class="set-group-t">Language</h3></div>
+          <div class="set-card">
+            <div class="set-row">
+              <div class="set-row-l">
+                <div class="set-row-t">Interface and AI output language</div>
+                <div class="set-row-d">This changes the app interface and the language requested for newly generated notes, quizzes, flashcards, and answers. Existing source material is not translated.</div>
+              </div>
+              <div class="set-row-r">
+                <div class="seg">
+                  <button type="button" class={"seg-opt" + (uiLanguage === "zh-CN" ? " on" : "")} onclick={() => chooseUiLanguage("zh-CN")}>Simplified Chinese</button>
+                  <button type="button" class={"seg-opt" + (uiLanguage === "en" ? " on" : "")} onclick={() => chooseUiLanguage("en")}>English</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
 
         <!-- Follow-Omarchy mirrors the desktop's Omarchy palette — meaningless on a phone. -->
         {#if !isMobile}

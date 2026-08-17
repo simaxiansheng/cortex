@@ -44,17 +44,15 @@ fn show_main_window(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
-    // Desktop-only plugins. Single-instance (a second launch reveals/focuses the
-    // existing window instead of spawning another process) and the auto-updater
-    // don't exist on mobile, where the OS / app store handle those. Gated so the
-    // iOS/Android build links without them.
+    // Desktop-only single-instance guard. This local Chinese edition deliberately
+    // does not load the upstream auto-updater: an official Cortex release would
+    // otherwise replace this separately packaged, translated app.
     #[cfg(desktop)]
     {
         builder = builder
             .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
                 show_main_window(app);
-            }))
-            .plugin(tauri_plugin_updater::Builder::new().build());
+            }));
     }
     builder
         .plugin(tauri_plugin_dialog::init())
@@ -71,7 +69,8 @@ pub fn run() {
             tauri::http::Response::builder()
                 .header("Content-Type", "text/html; charset=utf-8")
                 .body(
-                    b"<html><body style=\"font-family:system-ui;padding:2rem;background:#111;color:#eee\">Signed in to Moodle. You can close this window.</body></html>"
+                    "<html><body style=\"font-family:system-ui;padding:2rem;background:#111;color:#eee\">已登录 Moodle。现在可以关闭此窗口。</body></html>"
+                        .as_bytes()
                         .to_vec(),
                 )
                 .unwrap()
@@ -186,23 +185,90 @@ pub fn run() {
             // Desktop-only — there is no system tray on iOS/Android.
             #[cfg(desktop)]
             {
-                use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+                use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
                 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
-                let open = MenuItem::with_id(app, "open", "Open Cortex", true, None::<&str>)?;
+                // Tauri's default macOS menu is English. Build a native Chinese
+                // menu rather than leaving a translated webview under an English
+                // system bar. Predefined items keep the expected macOS actions and
+                // shortcuts while their visible labels follow this edition's locale.
+                let about = PredefinedMenuItem::about(app, Some("关于 Cortex 中文版"), None)?;
+                let services = PredefinedMenuItem::services(app, Some("服务"))?;
+                let hide = PredefinedMenuItem::hide(app, Some("隐藏 Cortex 中文版"))?;
+                let hide_others = PredefinedMenuItem::hide_others(app, Some("隐藏其他应用"))?;
+                let show_all = PredefinedMenuItem::show_all(app, Some("显示全部"))?;
+                let quit_app = PredefinedMenuItem::quit(app, Some("退出 Cortex 中文版"))?;
+                let app_sep_1 = PredefinedMenuItem::separator(app)?;
+                let app_sep_2 = PredefinedMenuItem::separator(app)?;
+                let app_sep_3 = PredefinedMenuItem::separator(app)?;
+                let cortex_menu = Submenu::with_items(
+                    app,
+                    "Cortex 中文版",
+                    true,
+                    &[
+                        &about,
+                        &app_sep_1,
+                        &services,
+                        &app_sep_2,
+                        &hide,
+                        &hide_others,
+                        &show_all,
+                        &app_sep_3,
+                        &quit_app,
+                    ],
+                )?;
+
+                let close_window = PredefinedMenuItem::close_window(app, Some("关闭窗口"))?;
+                let file_menu = Submenu::with_items(app, "文件", true, &[&close_window])?;
+
+                let undo = PredefinedMenuItem::undo(app, Some("撤销"))?;
+                let redo = PredefinedMenuItem::redo(app, Some("重做"))?;
+                let cut = PredefinedMenuItem::cut(app, Some("剪切"))?;
+                let copy = PredefinedMenuItem::copy(app, Some("复制"))?;
+                let paste = PredefinedMenuItem::paste(app, Some("粘贴"))?;
+                let select_all = PredefinedMenuItem::select_all(app, Some("全选"))?;
+                let edit_sep_1 = PredefinedMenuItem::separator(app)?;
+                let edit_sep_2 = PredefinedMenuItem::separator(app)?;
+                let edit_menu = Submenu::with_items(
+                    app,
+                    "编辑",
+                    true,
+                    &[&undo, &redo, &edit_sep_1, &cut, &copy, &paste, &edit_sep_2, &select_all],
+                )?;
+
+                let fullscreen = PredefinedMenuItem::fullscreen(app, Some("进入全屏"))?;
+                let view_menu = Submenu::with_items(app, "显示", true, &[&fullscreen])?;
+
+                let minimize = PredefinedMenuItem::minimize(app, Some("最小化"))?;
+                let maximize = PredefinedMenuItem::maximize(app, Some("缩放"))?;
+                let bring_all_to_front =
+                    PredefinedMenuItem::bring_all_to_front(app, Some("全部置于前台"))?;
+                let window_sep = PredefinedMenuItem::separator(app)?;
+                let window_menu = Submenu::with_items(
+                    app,
+                    "窗口",
+                    true,
+                    &[&minimize, &maximize, &window_sep, &bring_all_to_front],
+                )?;
+
+                let native_menu =
+                    Menu::with_items(app, &[&cortex_menu, &file_menu, &edit_menu, &view_menu, &window_menu])?;
+                app.set_menu(native_menu)?;
+
+                let open = MenuItem::with_id(app, "open", "打开 Cortex", true, None::<&str>)?;
                 let dashboard =
-                    MenuItem::with_id(app, "dashboard", "Go to Dashboard", true, None::<&str>)?;
+                    MenuItem::with_id(app, "dashboard", "前往概览", true, None::<&str>)?;
                 let music =
-                    MenuItem::with_id(app, "music", "Play / pause music", true, None::<&str>)?;
+                    MenuItem::with_id(app, "music", "播放/暂停音乐", true, None::<&str>)?;
                 let sep1 = PredefinedMenuItem::separator(app)?;
-                let restart = MenuItem::with_id(app, "restart", "Restart Cortex", true, None::<&str>)?;
-                let quit = MenuItem::with_id(app, "quit", "Quit Cortex", true, None::<&str>)?;
-                let menu = Menu::with_items(app, &[&open, &dashboard, &music, &sep1, &restart, &quit])?;
+                let restart = MenuItem::with_id(app, "restart", "重新启动 Cortex", true, None::<&str>)?;
+                let quit = MenuItem::with_id(app, "quit", "退出 Cortex", true, None::<&str>)?;
+                let tray_menu = Menu::with_items(app, &[&open, &dashboard, &music, &sep1, &restart, &quit])?;
                 let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
                 TrayIconBuilder::with_id("cortex-tray")
                     .icon(icon)
-                    .tooltip("Cortex")
-                    .menu(&menu)
+                    .tooltip("Cortex 中文版")
+                    .menu(&tray_menu)
                     .show_menu_on_left_click(false)
                     .on_menu_event(|app, event| match event.id.as_ref() {
                         "open" => show_main_window(app),
@@ -347,6 +413,7 @@ pub fn run() {
             commands::export_pdf,
             commands::export_database,
             commands::export_anki,
+            commands::import_material_to_anki,
             commands::import_anki,
             backup::backup_status,
             backup::backup_now,
@@ -355,6 +422,7 @@ pub fn run() {
             commands::synthesize_overview,
             commands::list_materials,
             commands::delete_material,
+            commands::delete_quiz_question,
             commands::rename_material,
             commands::add_citation,
             commands::list_citations,
@@ -363,6 +431,7 @@ pub fn run() {
             commands::get_all_settings,
             commands::set_settings,
             commands::ollama_models,
+            commands::test_embedding,
             commands::verify_provider,
             commands::save_recording,
             commands::save_recording_raw,
@@ -521,5 +590,55 @@ mod pipeline_tests {
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].source_count, 1);
         assert_eq!(subs[0].topics[0].sources[0].name, "dp.md");
+    }
+
+    #[test]
+    fn focused_retrieval_never_leaks_outside_selected_sources() {
+        let st = AppState::in_memory().unwrap();
+        let c = st.db.lock().unwrap();
+        let sid = repo::insert_subject(&c, "SEO research", None, None, None).unwrap();
+        let tid = repo::insert_topic(&c, &sid, "Keyword discovery", None, &[]).unwrap();
+        let wanted = repo::insert_source(&c, &sid, Some(&tid), "new-terms.pdf", "pdf", None).unwrap();
+        let excluded = repo::insert_source(&c, &sid, Some(&tid), "site-design.pdf", "pdf", None).unwrap();
+        let emb = embed::StubEmbedder;
+
+        let wanted_text = "Find emerging keywords by comparing search trends, community language, and competitor gaps.";
+        let excluded_text = "Choose a responsive layout, internal links, and a homepage information architecture.";
+        for (source_id, text) in [(&wanted, wanted_text), (&excluded, excluded_text)] {
+            let vector = emb.embed(&[text.to_string()]).unwrap().pop().unwrap();
+            repo::insert_chunk(
+                &c,
+                source_id,
+                &sid,
+                Some(&tid),
+                0,
+                text,
+                None,
+                vector.len() as i64,
+                &f32s_to_blob(&vector),
+            )
+            .unwrap();
+        }
+
+        let query = emb
+            .embed(&["how to find new keywords and validate trends".into()])
+            .unwrap()
+            .pop()
+            .unwrap();
+        let selected = vec![wanted.clone()];
+        let semantic = repo::search_chunks_in_sources(&c, &sid, &selected, &query, 8).unwrap();
+        assert!(!semantic.is_empty());
+        assert!(semantic.iter().all(|hit| hit.source_id == wanted));
+
+        let keyword = repo::keyword_search_chunks_in_sources(
+            &c,
+            &sid,
+            &selected,
+            "keyword trends competitor gaps",
+            8,
+        )
+        .unwrap();
+        assert!(!keyword.is_empty());
+        assert!(keyword.iter().all(|hit| hit.source_id == wanted));
     }
 }

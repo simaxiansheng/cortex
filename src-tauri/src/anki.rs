@@ -80,6 +80,21 @@ fn field_checksum(field: &str) -> i64 {
     u32::from_be_bytes([d[0], d[1], d[2], d[3]]) as i64
 }
 
+/// Stable Anki note GUID for one logical Cortex card. Anki uses note identity
+/// while importing a package, so keeping this deterministic lets a repeated
+/// export of the same material/front update the same logical note instead of
+/// looking like a brand-new random card every time.
+fn note_guid(identity: &str, front: &str) -> String {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let source = format!("cortex\u{001f}{identity}\u{001f}{}", strip_html(front));
+    let digest = sha1(source.as_bytes());
+    let mut guid = String::with_capacity(10);
+    for (idx, byte) in digest.iter().take(10).enumerate() {
+        guid.push(ALPHABET[(*byte as usize + idx * 17) % ALPHABET.len()] as char);
+    }
+    guid
+}
+
 /// Minimal HTML tag strip — fronts are usually plain text, but Anki computes the
 /// checksum on stripped content, so mirror that for stable dedupe.
 fn strip_html(s: &str) -> String {
@@ -203,9 +218,132 @@ CREATE INDEX ix_cards_sched on cards (did, queue, due);
 CREATE INDEX ix_revlog_cid on revlog (cid);
 ";
 
+#[derive(Clone, Copy)]
+struct AnkiTemplate {
+    name: &'static str,
+    css: &'static str,
+    qfmt: &'static str,
+    afmt: &'static str,
+}
+
+const BASIC_TEMPLATE: AnkiTemplate = AnkiTemplate {
+    name: "Cortex Basic",
+    css: ".card{font-family:arial;font-size:20px;text-align:center;color:black;background:white;}",
+    qfmt: "{{Front}}",
+    afmt: "{{FrontSide}}\n\n<hr id=answer>\n\n{{Back}}",
+};
+
+// Anki cards are web pages, so this template can attach a small, dependency-free
+// click handler to the options exported in a Cortex quiz. It checks the choice on
+// the front immediately; the native Anki answer/rating controls still decide the
+// spaced-repetition grade afterward.
+const MULTIPLE_CHOICE_TEMPLATE: AnkiTemplate = AnkiTemplate {
+    name: "Cortex Multiple Choice",
+    css: r#"
+.card { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 20px; text-align: left; color: #1f2937; background: #ffffff; }
+.cortex-mcq { max-width: 720px; margin: 0 auto; line-height: 1.45; }
+.cortex-question { margin: 0 0 20px; font-size: 1.25em; font-weight: 650; }
+.cortex-options { display: grid; gap: 10px; }
+.cortex-choice { width: 100%; display: flex; align-items: flex-start; gap: 11px; padding: 13px 15px; color: inherit; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 10px; font: inherit; text-align: left; cursor: pointer; }
+.cortex-choice:hover:not(:disabled) { background: #eef2ff; border-color: #6366f1; }
+.cortex-choice:disabled { cursor: default; opacity: 1; }
+.cortex-choice-key { flex: none; display: inline-grid; place-items: center; width: 1.65em; height: 1.65em; border: 1px solid currentColor; border-radius: 50%; font-size: .82em; font-weight: 700; }
+.cortex-choice.cortex-correct { color: #166534; background: #dcfce7; border-color: #22c55e; }
+.cortex-choice.cortex-wrong { color: #991b1b; background: #fee2e2; border-color: #ef4444; }
+.cortex-feedback, .cortex-answer-panel { margin-top: 18px; padding: 14px 16px; border-radius: 10px; background: #f8fafc; border: 1px solid #cbd5e1; }
+.cortex-feedback.cortex-feedback-correct { color: #166534; background: #f0fdf4; border-color: #86efac; }
+.cortex-feedback.cortex-feedback-wrong { color: #991b1b; background: #fef2f2; border-color: #fca5a5; }
+.cortex-explanation { margin-top: 10px; color: #475569; }
+.nightMode .card { color: #e5e7eb; background: #1f2937; }
+.nightMode .cortex-choice { color: #e5e7eb; background: #273449; border-color: #475569; }
+.nightMode .cortex-choice:hover:not(:disabled) { background: #303d56; border-color: #818cf8; }
+.nightMode .cortex-choice.cortex-correct { color: #bbf7d0; background: #14532d; border-color: #4ade80; }
+.nightMode .cortex-choice.cortex-wrong { color: #fecaca; background: #7f1d1d; border-color: #f87171; }
+.nightMode .cortex-feedback, .nightMode .cortex-answer-panel { color: #e5e7eb; background: #273449; border-color: #475569; }
+.nightMode .cortex-feedback.cortex-feedback-correct { color: #bbf7d0; background: #14532d; border-color: #4ade80; }
+.nightMode .cortex-feedback.cortex-feedback-wrong { color: #fecaca; background: #7f1d1d; border-color: #f87171; }
+.nightMode .cortex-explanation { color: #cbd5e1; }
+"#,
+    qfmt: r#"
+{{Front}}
+<script>
+(function () {
+  var root = document.querySelector('.cortex-mcq[data-cortex-mcq]');
+  if (!root || root.dataset.cortexBound === '1') return;
+  root.dataset.cortexBound = '1';
+  var correctIndex = Number(root.dataset.answerIndex);
+  var choices = Array.prototype.slice.call(root.querySelectorAll('.cortex-choice'));
+  var feedback = root.querySelector('.cortex-feedback');
+  var answerData = root.querySelector('.cortex-answer-data');
+  function revealNativeAnswer() {
+    // AnkiMobile has no public JS show-answer API. Its card webview exposes the
+    // same bridge used for configured taps, so request the user's middle-center
+    // tap first (normally mapped to “Show Answer”); desktop and AnkiDroid retain
+    // their respective native paths.
+    var mobileBridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.cb;
+    if (mobileBridge) {
+      mobileBridge.postMessage(JSON.stringify({ scheme: 'ankitap', msg: 'midCenter' }));
+    } else if (typeof pycmd === 'function') {
+      pycmd('ans');
+    } else if (typeof window.showAnswer === 'function') {
+      window.showAnswer();
+    } else if (window.anki && window.sendMessage2) {
+      window.sendMessage2('ankitap', 'midCenter');
+    }
+  }
+  choices.forEach(function (choice) {
+    choice.addEventListener('click', function () {
+      if (root.dataset.cortexAnswered === '1') return;
+      root.dataset.cortexAnswered = '1';
+      var picked = Number(choice.dataset.index);
+      choices.forEach(function (button) {
+        button.disabled = true;
+        if (Number(button.dataset.index) === correctIndex) button.classList.add('cortex-correct');
+      });
+      var isCorrect = picked === correctIndex;
+      if (!isCorrect) choice.classList.add('cortex-wrong');
+      if (!feedback || !answerData) return;
+      feedback.classList.add(isCorrect ? 'cortex-feedback-correct' : 'cortex-feedback-wrong');
+      feedback.innerHTML = (isCorrect ? '<strong>✓ 回答正确</strong>' : '<strong>✕ 回答错误</strong>') + answerData.innerHTML;
+      // Match Anki's own “Show Answer” button after a short confirmation beat,
+      // so its native Again/Hard/Good/Easy controls appear without a second tap.
+      window.setTimeout(function () {
+        revealNativeAnswer();
+      }, 550);
+    });
+  });
+})();
+</script>
+"#,
+    afmt: r#"
+{{FrontSide}}
+<hr id=answer>
+<div class="cortex-answer-panel">{{Back}}</div>
+<script>
+(function () {
+  var root = document.querySelector('.cortex-mcq[data-cortex-mcq]');
+  if (!root) return;
+  var correctIndex = Number(root.dataset.answerIndex);
+  Array.prototype.slice.call(root.querySelectorAll('.cortex-choice')).forEach(function (choice) {
+    choice.disabled = true;
+    if (Number(choice.dataset.index) === correctIndex) choice.classList.add('cortex-correct');
+  });
+})();
+</script>
+"#,
+};
+
 /// Build a `collection.anki2` SQLite file at `path` containing one Basic note +
-/// card per (front, back) pair, all in a deck named `deck_name`.
-fn build_collection(path: &Path, deck_name: &str, cards: &[(String, String)]) -> Result<()> {
+/// card per (front, back) pair, all in a deck named `deck_name`, with a separate
+/// stable identity seed. Direct Cortex → Anki hand-offs use a material id here,
+/// so renaming a material does not cause it to appear as different Anki notes.
+fn build_collection_with_identity(
+    path: &Path,
+    deck_name: &str,
+    cards: &[(String, String)],
+    identity: &str,
+    template: AnkiTemplate,
+) -> Result<()> {
     // Start from a clean file — a stale temp left by a crashed prior run would
     // already hold the `col` table and make CREATE TABLE fail ("already exists").
     let _ = std::fs::remove_file(path);
@@ -219,16 +357,16 @@ fn build_collection(path: &Path, deck_name: &str, cards: &[(String, String)]) ->
 
     let model = serde_json::json!({
         mid.to_string(): {
-            "id": mid, "name": "Cortex Basic", "type": 0, "mod": crt, "usn": -1,
+            "id": mid, "name": template.name, "type": 0, "mod": crt, "usn": -1,
             "sortf": 0, "did": did, "latexPre": "", "latexPost": "", "latexsvg": false,
-            "css": ".card{font-family:arial;font-size:20px;text-align:center;color:black;background:white;}",
+            "css": template.css,
             "flds": [
                 {"name":"Front","ord":0,"sticky":false,"rtl":false,"font":"Arial","size":20,"media":[]},
                 {"name":"Back","ord":1,"sticky":false,"rtl":false,"font":"Arial","size":20,"media":[]}
             ],
             "tmpls": [
-                {"name":"Card 1","ord":0,"qfmt":"{{Front}}",
-                 "afmt":"{{FrontSide}}\n\n<hr id=answer>\n\n{{Back}}","did":null,"bqfmt":"","bafmt":""}
+                {"name":"Card 1","ord":0,"qfmt":template.qfmt,
+                 "afmt":template.afmt,"did":null,"bqfmt":"","bafmt":""}
             ],
             "req": [[0, "any", [0]]], "tags": [], "vers": []
         }
@@ -264,7 +402,7 @@ fn build_collection(path: &Path, deck_name: &str, cards: &[(String, String)]) ->
         let nid = now + 100 + idx as i64;
         let cid = now + 100_000 + idx as i64;
         let flds = format!("{front}\u{001f}{back}");
-        let guid = format!("crtx{:x}", nid); // unique within the file
+        let guid = note_guid(identity, front);
         conn.execute(
             "INSERT INTO notes (id,guid,mid,mod,usn,tags,flds,sfld,csum,flags,data)
              VALUES (?1,?2,?3,?4,-1,'',?5,?6,?7,0,'')",
@@ -282,14 +420,41 @@ fn build_collection(path: &Path, deck_name: &str, cards: &[(String, String)]) ->
     Ok(())
 }
 
-/// Build a complete `.apkg` for the given cards and write it to `dest`.
-pub fn export_apkg(dest: &Path, deck_name: &str, cards: &[(String, String)]) -> Result<()> {
+/// Build an `.apkg` with a stable caller-supplied note identity. This is used
+/// when a Cortex material is directly opened in Anki; manual exports retain the
+/// deck-name identity used by [`export_apkg`].
+pub fn export_apkg_with_identity(
+    dest: &Path,
+    deck_name: &str,
+    cards: &[(String, String)],
+    identity: &str,
+) -> Result<()> {
+    export_apkg_with_template(dest, deck_name, cards, identity, BASIC_TEMPLATE)
+}
+
+/// Same package writer for the interactive quiz note type.
+pub fn export_quiz_apkg_with_identity(
+    dest: &Path,
+    deck_name: &str,
+    cards: &[(String, String)],
+    identity: &str,
+) -> Result<()> {
+    export_apkg_with_template(dest, deck_name, cards, identity, MULTIPLE_CHOICE_TEMPLATE)
+}
+
+fn export_apkg_with_template(
+    dest: &Path,
+    deck_name: &str,
+    cards: &[(String, String)],
+    identity: &str,
+    template: AnkiTemplate,
+) -> Result<()> {
     if cards.is_empty() {
         return Err(Error::Other("no flashcards to export".into()));
     }
     // Build collection.anki2 in a temp file, then read its bytes.
     let tmp = std::env::temp_dir().join(format!("cortex-anki-{}.anki2", temp_token()));
-    build_collection(&tmp, deck_name, cards)?;
+    build_collection_with_identity(&tmp, deck_name, cards, identity, template)?;
     let col_bytes = std::fs::read(&tmp).map_err(Error::Io)?;
     let _ = std::fs::remove_file(&tmp);
 
@@ -299,6 +464,130 @@ pub fn export_apkg(dest: &Path, deck_name: &str, cards: &[(String, String)]) -> 
     ]);
     std::fs::write(dest, zip).map_err(Error::Io)?;
     Ok(())
+}
+
+/// Escape a Cortex text field for Anki's HTML renderer while preserving line
+/// breaks. We intentionally leave Markdown syntax as plain text: existing Cortex
+/// cards use it, and Anki's Basic template does not understand Markdown.
+fn anki_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\n' => out.push_str("<br>"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn option_letter(index: usize) -> char {
+    (b'A' + (index % 26) as u8) as char
+}
+
+fn quiz_answer_html(
+    answer_index: usize,
+    answer: &str,
+    explain: Option<&str>,
+    tags: &[String],
+) -> String {
+    let mut out = format!(
+        "<br><br><strong>正确答案：</strong>{}. {}",
+        option_letter(answer_index),
+        anki_html(answer)
+    );
+    if let Some(explain) = explain.filter(|value| !value.is_empty()) {
+        out.push_str(&format!("<div class=\"cortex-explanation\"><strong>解析：</strong>{}</div>", anki_html(explain)));
+    }
+    if !tags.is_empty() {
+        out.push_str(&format!("<div class=\"cortex-explanation\"><small>标签：{}</small></div>", tags.iter().map(|tag| anki_html(tag)).collect::<Vec<_>>().join(" · ")));
+    }
+    out
+}
+
+fn interactive_quiz_front(
+    question: &str,
+    options: &[String],
+    answer_index: usize,
+    answer_html: &str,
+) -> String {
+    let choices = options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| format!(
+            "<button class=\"cortex-choice\" type=\"button\" data-index=\"{index}\"><span class=\"cortex-choice-key\">{}</span><span>{}</span></button>",
+            option_letter(index),
+            anki_html(option)
+        ))
+        .collect::<String>();
+    format!(
+        "<div class=\"cortex-mcq\" data-cortex-mcq data-answer-index=\"{answer_index}\"><div class=\"cortex-question\">{}</div><div class=\"cortex-options\">{choices}</div><div class=\"cortex-answer-data\" hidden>{answer_html}</div><div class=\"cortex-feedback\" aria-live=\"polite\"></div></div>",
+        anki_html(question)
+    )
+}
+
+/// Turn one Cortex material payload into Anki front/back pairs. Flashcards
+/// retain their normal Basic model; quiz cards use a dedicated Anki template
+/// that turns their A/B/C/D choices into clickable controls.
+pub fn cards_from_material(
+    kind: &str,
+    payload: &serde_json::Value,
+) -> Result<Vec<(String, String)>> {
+    let items = payload
+        .as_array()
+        .ok_or_else(|| Error::Other("material payload is not a card list".into()))?;
+    let cards: Vec<(String, String)> = match kind {
+        "flashcards" => items
+            .iter()
+            .filter_map(|item| {
+                let front = item["q"].as_str()?.trim();
+                let back = item["a"].as_str().unwrap_or("").trim();
+                (!front.is_empty()).then(|| (anki_html(front), anki_html(back)))
+            })
+            .collect(),
+        "quiz" => items
+            .iter()
+            .filter_map(|item| {
+                let question = item["q"].as_str()?.trim();
+                let options = item["options"].as_array()?;
+                let answer_index = item["answer"].as_u64()? as usize;
+                let answer = options.get(answer_index)?.as_str()?.trim();
+                if question.is_empty() || answer.is_empty() {
+                    return None;
+                }
+                let options: Vec<String> = options
+                    .iter()
+                    .map(|option| option.as_str().unwrap_or("").trim().to_string())
+                    .collect();
+                if options.iter().any(|option| option.is_empty()) {
+                    return None;
+                }
+                let explain = item["explain"].as_str().map(str::trim).filter(|v| !v.is_empty());
+                let tags: Vec<String> = item["tags"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tag| tag.as_str().map(str::trim).filter(|tag| !tag.is_empty()))
+                    .map(str::to_string)
+                    .collect();
+                let back = quiz_answer_html(answer_index, answer, explain, &tags);
+                let front = interactive_quiz_front(question, &options, answer_index, &back);
+                Some((front, back))
+            })
+            .collect(),
+        other => {
+            return Err(Error::Other(format!(
+                "Anki import supports flashcards and quizzes (this is a {other} material)."
+            )))
+        }
+    };
+    if cards.is_empty() {
+        return Err(Error::Other("this material has no cards to send to Anki".into()));
+    }
+    Ok(cards)
 }
 
 // ===== IMPORT: read an `.apkg` into (deck name → cards) ======================
@@ -558,7 +847,7 @@ mod tests {
             ("What is ATP?".to_string(), "Adenosine triphosphate".to_string()),
             ("Powerhouse of the cell?".to_string(), "Mitochondria".to_string()),
         ];
-        export_apkg(&dest, "Biology", &cards).unwrap();
+        export_apkg_with_identity(&dest, "Biology", &cards, "Biology").unwrap();
 
         let bytes = std::fs::read(&dest).unwrap();
         // ZIP local-file signature at the start, EOCD signature near the end.
@@ -570,13 +859,62 @@ mod tests {
 
         // The embedded collection.anki2 must be a real SQLite DB with 2 notes/cards.
         let tmp = dir.join("roundtrip.anki2");
-        build_collection(&tmp, "Biology", &cards).unwrap();
+        build_collection_with_identity(&tmp, "Biology", &cards, "Biology", BASIC_TEMPLATE).unwrap();
         let conn = Connection::open(&tmp).unwrap();
         let notes: i64 = conn.query_row("SELECT count(*) FROM notes", [], |r| r.get(0)).unwrap();
         let cnt: i64 = conn.query_row("SELECT count(*) FROM cards", [], |r| r.get(0)).unwrap();
         assert_eq!(notes, 2);
         assert_eq!(cnt, 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quiz_material_becomes_answerable_anki_cards() {
+        let payload = serde_json::json!([
+            {
+                "q": "Where should you look for new terms first?",
+                "options": ["Domain", "Blog comments", "Ads library", "Newsletter"],
+                "answer": 1,
+                "explain": "Comments show real user language.",
+                "tags": ["new terms", "research"]
+            }
+        ]);
+        let cards = cards_from_material("quiz", &payload).unwrap();
+        assert_eq!(cards.len(), 1);
+        assert!(cards[0].0.contains("cortex-mcq"));
+        assert!(cards[0].0.contains("cortex-choice"));
+        assert!(cards[0].0.contains("Domain"));
+        assert!(cards[0].0.contains("Blog comments"));
+        assert!(cards[0].1.contains("正确答案：</strong>B. Blog comments"));
+        assert!(cards[0].1.contains("解析：</strong>Comments show real user language."));
+        assert!(cards[0].1.contains("标签：new terms · research"));
+
+        let dir = std::env::temp_dir().join(format!("cortex-mcq-apkg-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("quiz.apkg");
+        export_quiz_apkg_with_identity(&dest, "Cortex::Research", &cards, "material-1").unwrap();
+        let db = extract_collection(&dest).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let models: String = conn.query_row("SELECT models FROM col", [], |row| row.get(0)).unwrap();
+        assert!(models.contains("Cortex Multiple Choice"));
+        assert!(models.contains("cortex-choice"));
+        assert!(models.contains("pycmd('ans')"));
+        assert!(models.contains("ankitap"));
+        assert!(models.contains("midCenter"));
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn note_guid_is_stable_per_deck_and_front() {
+        assert_eq!(
+            note_guid("Cortex::Research", "Find new terms"),
+            note_guid("Cortex::Research", "Find new terms")
+        );
+        assert_ne!(
+            note_guid("Cortex::Research", "Find new terms"),
+            note_guid("Cortex::Research", "Validate terms")
+        );
     }
 
     #[test]
@@ -601,7 +939,7 @@ mod tests {
             ("What is ATP?".to_string(), "Adenosine triphosphate".to_string()),
             ("Powerhouse of the cell?".to_string(), "Mitochondria".to_string()),
         ];
-        export_apkg(&dest, "Biology", &cards).unwrap();
+        export_apkg_with_identity(&dest, "Biology", &cards, "Biology").unwrap();
 
         let decks = import_apkg(&dest).unwrap();
         assert_eq!(decks.len(), 1, "one Anki deck → one imported deck");
@@ -627,7 +965,7 @@ mod tests {
             ("".to_string(), "no front".to_string()),  // empty front → skipped
             ("Unique".to_string(), "Yes".to_string()),
         ];
-        export_apkg(&dest, "Vocab", &cards).unwrap();
+        export_apkg_with_identity(&dest, "Vocab", &cards, "Vocab").unwrap();
 
         let decks = import_apkg(&dest).unwrap();
         assert_eq!(decks.len(), 1);

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { app } from "../lib/store.svelte";
   import * as api from "../lib/api";
+  import type { MaterialScope } from "../lib/api";
   import Icon from "../components/Icon.svelte";
   import { jobs, type JobKind } from "../lib/jobs.svelte";
 
@@ -18,10 +19,11 @@
     pdf: "PDF", pptx: "PPTX", docx: "DOCX", web: "WEB", yt: "YT", audio: "AUD", image: "IMG",
   };
 
-  // Count-based formats and their clamps; other formats have no "how many".
-  const COUNT_LIMITS: Record<string, { min: number; max: number; def: number }> = {
-    flashcards: { min: 4, max: 40, def: 14 },
-    quiz: { min: 3, max: 30, def: 10 },
+  // Count-based formats. Counts have a minimum but deliberately no product-imposed
+  // maximum: users can request as many quiz questions or flashcards as they need.
+  const COUNT_LIMITS: Record<string, { min: number; def: number }> = {
+    flashcards: { min: 4, def: 14 },
+    quiz: { min: 3, def: 10 },
   };
 
   // ── Derived from real active subject ─────────────────────────
@@ -37,6 +39,11 @@
   let sel   = $state<string[]>([]);
   let title = $state("");
   let customPrompt = $state("");
+  // `focus` retrieves only passages related to the student's target before the
+  // generation model sees them. `tagged` keeps broad coverage but labels each
+  // generated quiz question / flashcard by knowledge point.
+  let scope = $state<MaterialScope>("all");
+  let focusTopics = $state("");
   // Per-type item count (flashcards / quiz). Seeded from the defaults.
   let cardCount = $state(COUNT_LIMITS.flashcards.def);
   let quizCount = $state(COUNT_LIMITS.quiz.def);
@@ -45,6 +52,8 @@
   const selSources = $derived(allSources.filter(s => sel.includes(s.id)));
   const countLimit = $derived(COUNT_LIMITS[type] ?? null);
   const countValue = $derived(type === "flashcards" ? cardCount : type === "quiz" ? quizCount : null);
+  const supportsItemTags = $derived(type === "flashcards" || type === "quiz");
+  const needsFocus = $derived(scope === "focus");
 
   const counts = $derived.by(() => {
     const c: Record<string, number> = {};
@@ -76,7 +85,9 @@
     return autoTopic ? autoTopic + suffix : "";
   });
   const finalTitle = $derived(title.trim() || suggested);
-  const ready = $derived(sel.length > 0 && !!app.activeSubject);
+  const ready = $derived(
+    sel.length > 0 && !!app.activeSubject && (!needsFocus || focusTopics.trim().length > 0)
+  );
 
   // ── Actions ───────────────────────────────────────────────────
   function toggle(id: string) {
@@ -93,9 +104,15 @@
 
   function setCount(n: number) {
     if (!countLimit) return;
-    const v = Math.max(countLimit.min, Math.min(countLimit.max, Math.round(n) || countLimit.def));
+    const v = Math.max(countLimit.min, Math.round(n) || countLimit.def);
     if (type === "flashcards") cardCount = v;
     else if (type === "quiz") quizCount = v;
+  }
+
+  function selectType(next: string) {
+    type = next;
+    // Item-level tags only have a clear home on cards and quiz questions.
+    if (scope === "tagged" && next !== "flashcards" && next !== "quiz") scope = "all";
   }
 
   function generate() {
@@ -111,6 +128,7 @@
     const matTitle = finalTitle || undefined;
     const sourceIds = [...sel];
     const count = countValue ?? undefined;
+    const focus = focusTopics.trim() || undefined;
 
     jobs.start({
       kind,
@@ -126,6 +144,8 @@
           customPrompt.trim() || undefined,
           sourceIds,
           count,
+          scope,
+          focus,
         ),
     });
 
@@ -163,7 +183,7 @@
         <div class="onb-label mono">FORMAT</div>
         <div class="gm2-formats">
           {#each GEN_TYPES as t (t.id)}
-            <button class="gm2-format{type === t.id ? ' on' : ''}" onclick={() => (type = t.id)}>
+            <button class="gm2-format{type === t.id ? ' on' : ''}" onclick={() => selectType(t.id)}>
               <span class="gm2-format-ico" style:color={t.color}><Icon name={t.ico} size={16} /></span>
               <span class="gm2-format-txt">
                 <span class="gm2-format-label">{t.label}</span>
@@ -181,17 +201,82 @@
           <div class="gm2-count">
             <div class="gm2-step">
               <button class="btn btn--icon btn--sm" onclick={() => setCount(countValue - 1)} aria-label="fewer" disabled={countValue <= countLimit.min}>−</button>
-              <span class="mono gm2-step-v">{countValue}</span>
-              <button class="btn btn--icon btn--sm" onclick={() => setCount(countValue + 1)} aria-label="more" disabled={countValue >= countLimit.max}>+</button>
+              <input
+                class="input mono gm2-step-v gm2-step-input"
+                type="number"
+                min={countLimit.min}
+                step="1"
+                value={countValue}
+                aria-label={type === "quiz" ? "Number of questions" : "Number of cards"}
+                onchange={(event) => setCount(Number(event.currentTarget.value))}
+              />
+              <button class="btn btn--icon btn--sm" onclick={() => setCount(countValue + 1)} aria-label="more">+</button>
             </div>
             <div class="seg gm2-count-presets">
-              {#each [Math.round(countLimit.def / 2), countLimit.def, Math.min(countLimit.max, countLimit.def * 2)] as p}
+              {#each [Math.round(countLimit.def / 2), countLimit.def, countLimit.def * 2] as p}
                 <button class="seg-opt{countValue === p ? ' on' : ''}" onclick={() => setCount(p)}>{p}</button>
               {/each}
             </div>
           </div>
         </div>
       {/if}
+
+      <div class="gm2-block gm2-scope">
+        <div class="onb-label mono">GENERATION SCOPE</div>
+        <div class="gm2-scope-options">
+          <button
+            class="gm2-scope-opt{scope === 'all' ? ' on' : ''}"
+            aria-pressed={scope === "all"}
+            onclick={() => (scope = "all")}
+          >
+            <span class="gm2-scope-copy">
+              <span>All selected content</span>
+              <span class="mono">Use everything in the selected sources.</span>
+            </span>
+            {#if scope === "all"}<Icon name="check" size={13} color="var(--accent)" />{/if}
+          </button>
+          <button
+            class="gm2-scope-opt{scope === 'focus' ? ' on' : ''}"
+            aria-pressed={scope === "focus"}
+            onclick={() => (scope = "focus")}
+          >
+            <span class="gm2-scope-copy">
+              <span>Focus knowledge points</span>
+              <span class="mono">Retrieve only passages related to what you enter.</span>
+            </span>
+            {#if scope === "focus"}<Icon name="check" size={13} color="var(--accent)" />{/if}
+          </button>
+          {#if supportsItemTags}
+            <button
+              class="gm2-scope-opt{scope === 'tagged' ? ' on' : ''}"
+              aria-pressed={scope === "tagged"}
+              onclick={() => (scope = "tagged")}
+            >
+              <span class="gm2-scope-copy">
+                <span>All content + item tags</span>
+                <span class="mono">Generate broadly and label every question or card.</span>
+              </span>
+              {#if scope === "tagged"}<Icon name="check" size={13} color="var(--accent)" />{/if}
+            </button>
+          {/if}
+        </div>
+
+        {#if scope === "focus"}
+          <div class="field gm2-focus-field">
+            <!-- svelte-ignore a11y_label_has_associated_control -->
+            <label class="onb-label mono">KNOWLEDGE POINTS TO FOCUS ON <span class="gm2-label-hint">required for focus</span></label>
+            <textarea
+              class="input set-textarea"
+              bind:value={focusTopics}
+              rows="3"
+              placeholder="e.g. How to find new terms: sources, filtering, validation, and workflow."
+            ></textarea>
+          </div>
+          <p class="gm2-scope-note mono">Cortex first retrieves matching passages from the selected sources. Unrelated passages are excluded.</p>
+        {:else if scope === "tagged"}
+          <p class="gm2-scope-note mono">Each generated question or card gets 1–3 concise topical tags.</p>
+        {/if}
+      </div>
 
       <div class="gm2-block">
         <div class="field">
@@ -323,7 +408,28 @@
   .gm2-count { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .gm2-step { display: flex; align-items: center; gap: 8px; }
   .gm2-step-v { min-width: 36px; text-align: center; color: var(--fg-bright); font-variant-numeric: tabular-nums; }
+  .gm2-step-input { width: 72px; min-width: 72px; height: 28px; padding: 0 6px; }
   .gm2-count-presets { margin-left: auto; }
+
+  /* Scope makes the difference between a free-form hint and a strict retrieval
+     boundary explicit before the user spends a generation request. */
+  .gm2-scope { gap: 8px; }
+  .gm2-scope-options { display: flex; flex-direction: column; gap: 6px; }
+  .gm2-scope-opt {
+    display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+    padding: 8px 10px; cursor: pointer; color: var(--fg-muted);
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--rad-3);
+    transition: border-color var(--dur-fast), background var(--dur-fast), color var(--dur-fast);
+  }
+  .gm2-scope-opt:hover { border-color: var(--border-strong); color: var(--fg-bright); }
+  .gm2-scope-opt.on {
+    border-color: var(--accent-dim); color: var(--fg-bright);
+    background: color-mix(in oklab, var(--accent) 8%, var(--surface));
+  }
+  .gm2-scope-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 1px; font-size: var(--t-sm); font-weight: 600; }
+  .gm2-scope-copy .mono { font-size: var(--t-2xs); color: var(--fg-faint); font-weight: 400; line-height: 1.35; }
+  .gm2-focus-field { margin-top: 2px; }
+  .gm2-scope-note { margin: 0; color: var(--fg-faint); font-size: var(--t-2xs); line-height: 1.45; }
 
   /* label qualifier — quietly subordinate to the uppercase mono eyebrow label */
   .gm2-label-hint { text-transform: none; letter-spacing: normal; color: var(--fg-faint); font-weight: 400; }

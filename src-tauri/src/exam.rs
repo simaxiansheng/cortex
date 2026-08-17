@@ -6,7 +6,7 @@
 //! (model_quiz spec → gemini fallback, `guard_offline_llm`, `apply_budget`,
 //! `llm::extract_json`) — reusing those helpers verbatim rather than duplicating.
 
-use crate::commands::{apply_budget, guard_offline_llm, read_keys};
+use crate::commands::{apply_budget, guard_offline_llm, output_language, read_keys};
 use crate::db::AppState;
 use crate::error::{Error, Result};
 use crate::llm;
@@ -71,7 +71,7 @@ pub async fn generate_exam(
         let duration = duration_min.clamp(5, 240);
 
         // Gather context + model config under the DB lock (released before the call).
-        let (context, subject_name, topic_names, spec, keys) = {
+        let (context, subject_name, topic_names, spec, keys, language) = {
             let c = state.db.lock().unwrap();
             let context = exam_context(&c, &subject_id, &topics)?;
             let subj = repo::get_subject(&c, &subject_id)?;
@@ -89,7 +89,7 @@ pub async fn generate_exam(
             let spec = repo::get_setting(&c, "model_quiz")?
                 .unwrap_or_else(|| "openrouter:deepseek/deepseek-v4-flash".into());
             guard_offline_llm(&c, &spec)?;
-            (context, subj.name, topic_names, spec, read_keys(&c)?)
+            (context, subj.name, topic_names, spec, read_keys(&c)?, output_language(&c))
         };
 
         if context.trim().is_empty() {
@@ -110,7 +110,7 @@ pub async fn generate_exam(
         } else {
             format!("{subject_name} › {}", topic_names.join(", "))
         };
-        let system = format!(
+        let system = llm::with_output_language(&format!(
             "You are an exam writer. From the study material, produce a practice exam as a \
              STRICT JSON array of EXACTLY {total} questions: the FIRST {mcq_n} are \
              multiple-choice, the next {written_n} are written. Each item has this exact shape:\n\
@@ -124,7 +124,7 @@ pub async fn generate_exam(
              Respond with ONLY the raw JSON array — no markdown code fences, no prose.",
             total = mcq_n + written_n,
             first_written = mcq_n + 1,
-        );
+        ), &language);
         let user = format!(
             "Exam scope: {scope}\n\nSOURCE MATERIAL:\n{context}\n\nWrite the exam now."
         );
@@ -287,14 +287,14 @@ fn grade_exam_inner(app: &AppHandle, id: &str, answers: &[ExamAnswer]) -> Result
         let state = app.state::<AppState>();
 
         // Load the exam + model config under the lock.
-        let (exam, context, spec, keys) = {
+        let (exam, context, spec, keys, language) = {
             let c = state.db.lock().unwrap();
             let exam = repo::get_exam(&c, id)?;
             let topics: Vec<String> = exam.topic_ids.clone();
             let context = exam_context(&c, &exam.subject_id, &topics)?;
             let spec = repo::get_setting(&c, "model_quiz")?
                 .unwrap_or_else(|| "openrouter:deepseek/deepseek-v4-flash".into());
-            (exam, context, spec, read_keys(&c)?)
+            (exam, context, spec, read_keys(&c)?, output_language(&c))
         };
 
         let questions = exam.questions.as_array().cloned().unwrap_or_default();
@@ -390,6 +390,7 @@ fn grade_exam_inner(app: &AppHandle, id: &str, answers: &[ExamAnswer]) -> Result
                  Respond with ONLY a raw JSON array \
                  [{\"id\":\"...\",\"verify\":\"...\",\"score\":<number>,\"feedback\":\"...\"}], \
                  one entry per item, same ids, fields in that order. No prose, no code fences.";
+            let system = llm::with_output_language(system, &language);
             let user = format!(
                 "SOURCE MATERIAL:\n{context}\n\nANSWERS TO GRADE (JSON):\n{items_json}\n\nGrade now."
             );
@@ -400,7 +401,7 @@ fn grade_exam_inner(app: &AppHandle, id: &str, answers: &[ExamAnswer]) -> Result
             // produced the "grading is temporarily unavailable" zeros).
             let floor = 2048 + 700 * written_prompt_items.len() as u32;
             model.set_max_tokens(floor.max(4096));
-            let mut raw = model.complete(system, &user)?;
+            let mut raw = model.complete(&system, &user)?;
             if llm::extract_json(&raw).is_err() {
                 eprintln!(
                     "[exam] grading reply unparseable (model {}), retrying once: {}",
@@ -408,7 +409,7 @@ fn grade_exam_inner(app: &AppHandle, id: &str, answers: &[ExamAnswer]) -> Result
                     raw.chars().take(300).collect::<String>()
                 );
                 raw = model.complete(
-                    system,
+                    &system,
                     &format!(
                         "{user}\n\nIMPORTANT: your previous reply could not be parsed. \
                          Respond with ONLY the raw JSON array — no thinking, no prose, \

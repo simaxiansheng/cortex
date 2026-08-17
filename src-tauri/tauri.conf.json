@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Cortex",
+  "productName": "Cortex 中文版",
   "version": "1.0.35",
-  "identifier": "study.cortex.app",
+  "identifier": "study.cortex.zh",
   "build": {
     "beforeDevCommand": "bun run sidecars && bun run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Cortex",
+        "title": "Cortex 中文版",
         "width": 1400,
         "height": 900,
         "minWidth": 720,
@@ -33,7 +33,7 @@
   "bundle": {
     "active": true,
     "targets": ["deb", "rpm", "appimage"],
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "externalBin": [
       "binaries/yt-dlp",
       "binaries/age",
@@ -49,14 +49,6 @@
     "linux": {
       "deb": { "depends": ["poppler-utils", "ffmpeg"] },
       "rpm": { "depends": ["poppler-utils", "ffmpeg"] }
-    }
-  },
-  "plugins": {
-    "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFBNUMwMkRCRThCNDBBMDkKUldRSkNyVG8yd0pjcXFoSUlTcUNGdk1IMlFMdElZZXRrQnp5cndpSWtVYy9RZlpuS1lBTUpOOUEK",
-      "endpoints": [
-        "https://github.com/PndaMan/cortex/releases/latest/download/latest.json"
-      ]
     }
   }
 }
