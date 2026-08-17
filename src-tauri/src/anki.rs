@@ -275,6 +275,22 @@ const MULTIPLE_CHOICE_TEMPLATE: AnkiTemplate = AnkiTemplate {
   var choices = Array.prototype.slice.call(root.querySelectorAll('.cortex-choice'));
   var feedback = root.querySelector('.cortex-feedback');
   var answerData = root.querySelector('.cortex-answer-data');
+  function revealNativeAnswer() {
+    // AnkiMobile has no public JS show-answer API. Its card webview exposes the
+    // same bridge used for configured taps, so request the user's middle-center
+    // tap first (normally mapped to “Show Answer”); desktop and AnkiDroid retain
+    // their respective native paths.
+    var mobileBridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.cb;
+    if (mobileBridge) {
+      mobileBridge.postMessage(JSON.stringify({ scheme: 'ankitap', msg: 'midCenter' }));
+    } else if (typeof pycmd === 'function') {
+      pycmd('ans');
+    } else if (typeof window.showAnswer === 'function') {
+      window.showAnswer();
+    } else if (window.anki && window.sendMessage2) {
+      window.sendMessage2('ankitap', 'midCenter');
+    }
+  }
   choices.forEach(function (choice) {
     choice.addEventListener('click', function () {
       if (root.dataset.cortexAnswered === '1') return;
@@ -292,7 +308,7 @@ const MULTIPLE_CHOICE_TEMPLATE: AnkiTemplate = AnkiTemplate {
       // Match Anki's own “Show Answer” button after a short confirmation beat,
       // so its native Again/Hard/Good/Easy controls appear without a second tap.
       window.setTimeout(function () {
-        if (typeof pycmd === 'function') pycmd('ans');
+        revealNativeAnswer();
       }, 550);
     });
   });
@@ -883,6 +899,8 @@ mod tests {
         assert!(models.contains("Cortex Multiple Choice"));
         assert!(models.contains("cortex-choice"));
         assert!(models.contains("pycmd('ans')"));
+        assert!(models.contains("ankitap"));
+        assert!(models.contains("midCenter"));
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_dir_all(&dir);
     }
