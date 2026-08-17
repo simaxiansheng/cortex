@@ -2209,6 +2209,21 @@ fn anki_cards_for_material(mat: &MaterialRec) -> Result<Vec<(String, String)>> {
     crate::anki::cards_from_material(&mat.kind, &mat.payload)
 }
 
+fn write_anki_material(
+    dest: &Path,
+    deck_name: &str,
+    material: &MaterialRec,
+    identity: &str,
+) -> Result<usize> {
+    let cards = anki_cards_for_material(material)?;
+    if material.kind == "quiz" {
+        crate::anki::export_quiz_apkg_with_identity(dest, deck_name, &cards, identity)?;
+    } else {
+        crate::anki::export_apkg_with_identity(dest, deck_name, &cards, identity)?;
+    }
+    Ok(cards.len())
+}
+
 /// Export a flashcard or quiz material to an Anki `.apkg` deck at `dest`.
 #[tauri::command]
 pub async fn export_anki(app: AppHandle, material_id: String, dest: String) -> Result<usize> {
@@ -2218,10 +2233,8 @@ pub async fn export_anki(app: AppHandle, material_id: String, dest: String) -> R
             let c = state.db.lock().unwrap();
             repo::get_material(&c, &material_id)?
         };
-        let cards = anki_cards_for_material(&mat)?;
         let deck_name = if mat.title.trim().is_empty() { "Cortex deck" } else { mat.title.trim() };
-        crate::anki::export_apkg(std::path::Path::new(&dest), deck_name, &cards)?;
-        Ok(cards.len())
+        write_anki_material(Path::new(&dest), deck_name, &mat, deck_name)
     })
     .await
     .map_err(|e| Error::Other(format!("anki export task failed: {e}")))?
@@ -2248,13 +2261,19 @@ pub async fn import_material_to_anki(app: AppHandle, material_id: String) -> Res
             let c = state.db.lock().unwrap();
             repo::get_material(&c, &material_id)?
         };
-        let cards = anki_cards_for_material(&mat)?;
         let deck_title = if mat.title.trim().is_empty() {
             "Cortex deck".to_string()
         } else {
             mat.title.trim().to_string()
         };
-        let deck_name = format!("Cortex::{deck_title}");
+        // Keep the upgraded interactive quiz note type in its own Anki subdeck.
+        // This prevents an older Cortex Basic quiz import from being mixed with
+        // the new clickable-choice cards when the student re-imports it.
+        let deck_name = if mat.kind == "quiz" {
+            format!("Cortex::选择题::{deck_title}")
+        } else {
+            format!("Cortex::{deck_title}")
+        };
 
         // Keep the archive instead of deleting it after `open`: Anki receives the
         // file asynchronously, and retaining a local copy also makes a failed
@@ -2266,7 +2285,7 @@ pub async fn import_material_to_anki(app: AppHandle, material_id: String) -> Res
             .join("anki_exports");
         std::fs::create_dir_all(&dir).map_err(Error::Io)?;
         let dest = dir.join(format!("cortex-{material_id}-{}.apkg", crate::db::now_ms()));
-        crate::anki::export_apkg_with_identity(&dest, &deck_name, &cards, &material_id)?;
+        let card_count = write_anki_material(&dest, &deck_name, &mat, &material_id)?;
 
         let status = std::process::Command::new("/usr/bin/open")
             .arg("-a")
@@ -2277,7 +2296,7 @@ pub async fn import_material_to_anki(app: AppHandle, material_id: String) -> Res
         if !status.success() {
             return Err(Error::Other("Anki could not open the generated deck.".into()));
         }
-        Ok(cards.len())
+        Ok(card_count)
     })
     .await
     .map_err(|e| Error::Other(format!("Anki import task failed: {e}")))?
